@@ -9,9 +9,9 @@ resources:
 # Change newName/newTag per environment (e.g., pin a SHA or use a private registry).
 images:
   - name: quay.io/opendatahub/odh-data-connect-hub-rest
-    digest: sha256:4deef1160009b43403d2c693510fd78bbbe9ff88c1ee67110cd3faf325d49c68
+    digest: sha256:149a8cde009f32eddae80d816d0cc057875ae05c282375c97c5828a76ce1a1d5
   - name: quay.io/opendatahub/odh-data-connect-hub-flight
-    digest: sha256:94009d5dcd1c44ddf30d45ff9a40644ee7a6ce4a997e68d38b17ee2c476cf856
+    digest: sha256:e8fea13b5f55b09d31559fdeded893e19cef6d50ae57d459866c0fd2b7ec4884
 
 patches:
   # -- Environment variables --
