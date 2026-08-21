@@ -129,6 +129,37 @@ pub fn bolt_value_to_json(bolt: &BoltType) -> serde_json::Value {
     }
 }
 
+pub fn json_to_bolt_type(value: &serde_json::Value) -> BoltType {
+    match value {
+        serde_json::Value::Null => BoltType::Null(neo4rs::BoltNull),
+        serde_json::Value::Bool(b) => BoltType::Boolean(neo4rs::BoltBoolean { value: *b }),
+        serde_json::Value::Number(n) => {
+            if let Some(i) = n.as_i64() {
+                BoltType::Integer(neo4rs::BoltInteger { value: i })
+            } else if let Some(f) = n.as_f64() {
+                BoltType::Float(neo4rs::BoltFloat { value: f })
+            } else {
+                BoltType::String(n.to_string().into())
+            }
+        },
+        serde_json::Value::String(s) => BoltType::String(s.as_str().into()),
+        serde_json::Value::Array(arr) => {
+            let mut list = neo4rs::BoltList::new();
+            for item in arr {
+                list.push(json_to_bolt_type(item));
+            }
+            BoltType::List(list)
+        },
+        serde_json::Value::Object(obj) => {
+            let mut map = neo4rs::BoltMap::new();
+            for (k, v) in obj {
+                map.put(k.as_str().into(), json_to_bolt_type(v));
+            }
+            BoltType::Map(map)
+        },
+    }
+}
+
 fn bolt_map_to_json_object(map: &neo4rs::BoltMap) -> serde_json::Value {
     let obj: serde_json::Map<String, serde_json::Value> = map
         .value
@@ -245,5 +276,69 @@ mod tests {
         assert_eq!(json["srid"], 4326);
         assert_eq!(json["x"], 1.5);
         assert_eq!(json["y"], 2.5);
+    }
+
+    #[test]
+    fn test_json_to_bolt_null() {
+        let bolt = json_to_bolt_type(&serde_json::Value::Null);
+        assert!(matches!(bolt, BoltType::Null(_)));
+    }
+
+    #[test]
+    fn test_json_to_bolt_bool() {
+        let bolt = json_to_bolt_type(&serde_json::json!(true));
+        assert!(matches!(bolt, BoltType::Boolean(BoltBoolean { value: true })));
+    }
+
+    #[test]
+    fn test_json_to_bolt_integer() {
+        let bolt = json_to_bolt_type(&serde_json::json!(42));
+        assert!(matches!(bolt, BoltType::Integer(BoltInteger { value: 42 })));
+    }
+
+    #[test]
+    fn test_json_to_bolt_float() {
+        let bolt = json_to_bolt_type(&serde_json::json!(2.72));
+        match bolt {
+            BoltType::Float(f) => assert!((f.value - 2.72).abs() < f64::EPSILON),
+            _ => panic!("expected Float"),
+        }
+    }
+
+    #[test]
+    fn test_json_to_bolt_string() {
+        let bolt = json_to_bolt_type(&serde_json::json!("hello"));
+        match bolt {
+            BoltType::String(s) => assert_eq!(s.value, "hello"),
+            _ => panic!("expected String"),
+        }
+    }
+
+    #[test]
+    fn test_json_to_bolt_array() {
+        let bolt = json_to_bolt_type(&serde_json::json!([1, "two", true]));
+        match bolt {
+            BoltType::List(list) => assert_eq!(list.len(), 3),
+            _ => panic!("expected List"),
+        }
+    }
+
+    #[test]
+    fn test_json_to_bolt_object() {
+        let bolt = json_to_bolt_type(&serde_json::json!({"name": "Alice", "age": 30}));
+        assert!(matches!(bolt, BoltType::Map(_)));
+    }
+
+    #[test]
+    fn test_json_bolt_roundtrip() {
+        let original = serde_json::json!({
+            "name": "Alice",
+            "age": 30,
+            "active": true,
+            "scores": [1, 2, 3]
+        });
+        let bolt = json_to_bolt_type(&original);
+        let back = bolt_value_to_json(&bolt);
+        assert_eq!(original, back);
     }
 }

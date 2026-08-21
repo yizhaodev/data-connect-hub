@@ -17,6 +17,43 @@ use neo4rs::{BoltType, Graph};
 
 use crate::types;
 
+struct ParsedQuery {
+    statement: String,
+    parameters: Vec<(String, neo4rs::BoltType)>,
+}
+
+fn parse_query_input(input: &str) -> ParsedQuery {
+    if let Ok(json) = serde_json::from_str::<serde_json::Value>(input)
+        && let Some(statement) = json.get("statement").and_then(|s| s.as_str())
+    {
+        let parameters = json
+            .get("parameters")
+            .and_then(|p| p.as_object())
+            .map(|obj| {
+                obj.iter()
+                    .map(|(k, v)| (k.clone(), types::json_to_bolt_type(v)))
+                    .collect()
+            })
+            .unwrap_or_default();
+        return ParsedQuery {
+            statement: statement.to_string(),
+            parameters,
+        };
+    }
+    ParsedQuery {
+        statement: input.to_string(),
+        parameters: Vec::new(),
+    }
+}
+
+fn build_neo4j_query(parsed: &ParsedQuery) -> neo4rs::Query {
+    let mut q = neo4rs::query(&parsed.statement);
+    for (key, value) in &parsed.parameters {
+        q = q.param(key, value.clone());
+    }
+    q
+}
+
 const KEY_URI: &str = "NEO4J_URI";
 const KEY_USERNAME: &str = "NEO4J_USERNAME";
 const KEY_PASSWORD: &str = "NEO4J_PASSWORD";
@@ -115,9 +152,10 @@ impl TabularReader for Neo4jReader {
     }
 
     async fn schema(&self, query: &str) -> Result<Arc<TabularState>, ConnectorError> {
+        let parsed = parse_query_input(query);
         let mut result = self
             .graph
-            .execute(neo4rs::query(query))
+            .execute(build_neo4j_query(&parsed))
             .await
             .map_err(map_neo4j_error)?;
 
@@ -161,8 +199,9 @@ impl TabularReader for Neo4jReader {
 
         #[allow(clippy::while_let_loop)]
         let stream = async_stream::try_stream! {
+            let parsed = parse_query_input(&query);
             let mut result = graph
-                .execute(neo4rs::query(&query))
+                .execute(build_neo4j_query(&parsed))
                 .await
                 .map_err(map_neo4j_error)?;
 
@@ -472,5 +511,61 @@ mod tests {
         let age_arr = batch.column(1).as_any().downcast_ref::<Int64Array>().unwrap();
         assert_eq!(age_arr.value(0), 30);
         assert_eq!(age_arr.value(1), 25);
+    }
+
+    #[test]
+    fn test_parse_query_input_plain_cypher() {
+        let parsed = parse_query_input("MATCH (n) RETURN n");
+        assert_eq!(parsed.statement, "MATCH (n) RETURN n");
+        assert!(parsed.parameters.is_empty());
+    }
+
+    #[test]
+    fn test_parse_query_input_json_with_params() {
+        let input = r#"{"statement": "MATCH (n) WHERE n.age > $age RETURN n", "parameters": {"age": 30}}"#;
+        let parsed = parse_query_input(input);
+        assert_eq!(parsed.statement, "MATCH (n) WHERE n.age > $age RETURN n");
+        assert_eq!(parsed.parameters.len(), 1);
+        assert_eq!(parsed.parameters[0].0, "age");
+        assert!(matches!(
+            parsed.parameters[0].1,
+            BoltType::Integer(neo4rs::BoltInteger { value: 30 })
+        ));
+    }
+
+    #[test]
+    fn test_parse_query_input_json_without_params() {
+        let input = r#"{"statement": "MATCH (n) RETURN n"}"#;
+        let parsed = parse_query_input(input);
+        assert_eq!(parsed.statement, "MATCH (n) RETURN n");
+        assert!(parsed.parameters.is_empty());
+    }
+
+    #[test]
+    fn test_parse_query_input_json_no_statement_field() {
+        let input = r#"{"query": "MATCH (n) RETURN n"}"#;
+        let parsed = parse_query_input(input);
+        assert_eq!(parsed.statement, r#"{"query": "MATCH (n) RETURN n"}"#);
+        assert!(parsed.parameters.is_empty());
+    }
+
+    #[test]
+    fn test_parse_query_input_multiple_params() {
+        let input = r#"{"statement": "MATCH (n:Person {name: $name}) WHERE n.age > $age RETURN n", "parameters": {"name": "Alice", "age": 30, "active": true}}"#;
+        let parsed = parse_query_input(input);
+        assert_eq!(parsed.parameters.len(), 3);
+    }
+
+    #[test]
+    fn test_build_neo4j_query_no_params() {
+        let parsed = parse_query_input("MATCH (n) RETURN n");
+        let _query = build_neo4j_query(&parsed);
+    }
+
+    #[test]
+    fn test_build_neo4j_query_with_params() {
+        let input = r#"{"statement": "MATCH (n) WHERE n.age > $age RETURN n", "parameters": {"age": 30}}"#;
+        let parsed = parse_query_input(input);
+        let _query = build_neo4j_query(&parsed);
     }
 }
