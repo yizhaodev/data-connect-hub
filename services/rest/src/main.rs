@@ -6,6 +6,7 @@ use crate::clients::flight::FlightClient;
 use crate::rest::endpoints::*;
 use crate::rest::errors::{json_config, path_config, query_config};
 use crate::rest::middleware::validate_headers;
+use crate::rest::otel::otel_http_metrics;
 use crate::utils::ServerConfig;
 use anyhow::Result;
 use commons::api::storage::MetaStore;
@@ -156,7 +157,8 @@ async fn main() -> Result<()> {
     let args = CommandLineArgs::parse();
     let config = Arc::new(load_config(args.config.clone(), args.secret_config.clone())?);
 
-    commons::utils::init_tracing(args.json_logs);
+    let telemetry = otel::init(&config.otel, "dch-rest-service")?;
+    otel::install_tracing(telemetry.as_ref(), args.json_logs)?;
     tracing::info!("Starting DataConnectorHub API service");
     log_config_source(&args.config, "--config", true);
     log_config_source(&args.secret_config, "--secret-config", false);
@@ -185,6 +187,7 @@ async fn main() -> Result<()> {
 
         App::new()
             .wrap(cors)
+            .wrap(middleware::from_fn(otel_http_metrics))
             .app_data(web::Data::from(service.clone()))
             .app_data(json_config())
             .app_data(query_config())

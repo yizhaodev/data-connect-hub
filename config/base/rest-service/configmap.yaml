@@ -17,3 +17,12 @@ data:
     [flight-service]
     address = "flight-service"
     port = 50051
+
+    [otel]
+    enabled = false
+    service_name = "dch-rest-service"
+    # protocol = "grpc"  # or "http"
+    # endpoint = "http://otel-collector.observability.svc:4317"
+    # Headers can also be set via the OTEL_EXPORTER_OTLP_HEADERS env var
+    # (format: "k1=v1,k2=v2"), and the endpoint via
+    # OTEL_EXPORTER_OTLP_ENDPOINT / OTEL_SERVICE_NAME.

@@ -24,10 +24,14 @@ data:
     enabled = true
     cache_ttl_secs = 60
 
-    [metrics]
-    enabled = true
-    address = "0.0.0.0"
-    port = 9090
+    [otel]
+    enabled = false
+    service_name = "dch-flight-service"
+    # protocol = "grpc"  # or "http"
+    # endpoint = "http://otel-collector.observability.svc:4317"
+    # Headers can also be set via the OTEL_EXPORTER_OTLP_HEADERS env var
+    # (format: "k1=v1,k2=v2"), and the endpoint via
+    # OTEL_EXPORTER_OTLP_ENDPOINT / OTEL_SERVICE_NAME.
 
     [connectors.default]
     connection_timeout_secs = 10

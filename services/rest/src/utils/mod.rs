@@ -2,6 +2,7 @@ use commons::api::connection_types::Secret;
 use commons::api::connections::Admin;
 use commons::api::connections::DataConnection;
 use commons::utils::config::GlobalConnectionTypes;
+use otel::OtelConfig;
 use pg_meta_store::store::DatabaseConfig;
 use serde::Deserialize;
 use std::collections::HashMap;
@@ -29,6 +30,8 @@ impl FlightService {
 pub struct ServerConfig {
     pub server: Server,
     pub database: DatabaseConfig,
+    #[serde(default)]
+    pub otel: OtelConfig,
     #[serde(rename = "global-connection-types")]
     pub global_connection_types: GlobalConnectionTypes,
     #[serde(rename = "flight-service")]

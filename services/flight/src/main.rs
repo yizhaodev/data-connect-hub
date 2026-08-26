@@ -7,7 +7,6 @@ use config::{Config, File};
 use elasticsearch_connector::ElasticsearchConnector;
 use flight_service::flight::TabularDataService;
 use flight_service::flight::auth::AuthLayer;
-use flight_service::flight::metrics::{install_prometheus_recorder, spawn_metrics_server};
 use flight_service::flight::registry::ConnectorsRegistry;
 use kube_utils::KubeAuthClient;
 use kube_utils::secrets::KubeSecretStore;
@@ -140,21 +139,6 @@ async fn configure_tls(
     Ok(builder)
 }
 
-fn configure_metrics(config: &ServerConfig) -> Result<()> {
-    if config.metrics.enabled {
-        tracing::info!(
-            "Prometheus metrics enabled on {}:{}",
-            config.metrics.address,
-            config.metrics.port
-        );
-        install_prometheus_recorder()?;
-        spawn_metrics_server(config.metrics.address.clone(), config.metrics.port);
-    } else {
-        tracing::info!("Prometheus metrics disabled");
-    }
-    Ok(())
-}
-
 async fn start_server(
     mut builder: tonic::transport::Server,
     auth: &utils::AuthConfig,
@@ -205,14 +189,15 @@ async fn main() -> Result<()> {
     let args = CommandLineArgs::parse();
     let config = load_config(args.config, args.secret_config)?;
     config.query.validate().map_err(|e| anyhow::anyhow!(e))?;
-    commons::utils::init_tracing(args.json_logs);
+
+    let telemetry = otel::init(&config.otel, "dch-flight-service")?;
+    otel::install_tracing(telemetry.as_ref(), args.json_logs)?;
 
     tracing::info!("Starting DataConnectorHub Flight service");
 
     let addr: std::net::SocketAddr = format!("{}:{}", config.server.address, config.server.port).parse()?;
     let builder = tonic::transport::Server::builder();
     let builder = configure_tls(builder, &config.tls).await?;
-    configure_metrics(&config)?;
 
     let connectors_registry = Arc::new(build_connectors_registry(&config));
     let secret_store = Arc::new(KubeSecretStore::try_default(Duration::from_secs(300)).await?);

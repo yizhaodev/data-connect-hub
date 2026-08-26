@@ -50,7 +50,7 @@ make sdk-all        # lint + typecheck + test
 ```text
 services/         binary crates (flight-service, rest-service)
 connectors/       data source connectors (connectors/postgres, connectors/sqlite)
-libs/             shared libraries (commons, pg-meta-store, kube-utils)
+libs/             shared libraries (commons, otel, pg-meta-store, kube-utils)
 dc-controller/    Go-based ODH operator controller
 sdk/python/       Python SDK (REST client)
 config/           Kustomize deployment configs
@@ -63,15 +63,21 @@ docs/             project documentation
 ```text
 services/flight (binary, gRPC :50051)
   -> libs/commons
+  -> libs/otel
   -> connectors/postgres -> libs/commons
 
 services/rest (binary, HTTP :8080)
   -> libs/commons
+  -> libs/otel
   -> connectors/postgres -> libs/commons
 ```
 
 - **libs/commons**: shared traits (`SQLReader`), types
   (`OutputStream`), and error definitions (`ConnectorError`)
+- **libs/otel**: shared OpenTelemetry setup. `otel::init(config,
+  service_name)` builds the SDK (OTLP gRPC/HTTP exporters for traces
+  and metrics) and `otel::install_tracing` bridges `tracing` to
+  spans. Services record metrics via `opentelemetry::global`.
 - **connectors/postgres**: library that executes SQL
   queries against PostgreSQL via SQLx and streams
   results as Arrow `RecordBatch`es

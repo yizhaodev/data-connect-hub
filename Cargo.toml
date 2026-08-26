@@ -1,6 +1,7 @@
 [workspace]
 members = [
     "libs/commons",
+    "libs/otel",
     "libs/kube-utils",
     "libs/pg-meta-store",
     "connectors/postgres",
@@ -23,6 +24,11 @@ unsafe_code = "deny"
 
 [workspace.dependencies]
 commons = { path = "libs/commons" }
+otel = { path = "libs/otel" }
+opentelemetry = { version = "0.32", default-features = false, features = ["trace", "metrics"] }
+opentelemetry_sdk = { version = "0.32", default-features = false, features = ["trace", "metrics", "rt-tokio"] }
+opentelemetry-otlp = { version = "0.32", default-features = false, features = ["grpc-tonic", "http-proto", "hyper-client", "trace", "metrics"] }
+tracing-opentelemetry = { version = "0.33", default-features = false, features = ["metrics"] }
 postgres-connector = { path = "connectors/postgres" }
 sqlite-connector = { path = "connectors/sqlite" }
 s3-connector = { path = "connectors/s3" }

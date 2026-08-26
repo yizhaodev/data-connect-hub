@@ -1,4 +1,5 @@
 use commons::utils::config::{ConnectorConfig, ConnectorConfigOverride, GlobalConnectionTypes};
+use otel::OtelConfig;
 use pg_meta_store::store::DatabaseConfig;
 use serde::Deserialize;
 
@@ -57,34 +58,6 @@ impl Default for AuthConfig {
             enabled: false,
             cache_ttl_secs: default_cache_ttl_secs(),
             token_review_audiences: vec![],
-        }
-    }
-}
-
-#[derive(Debug, Deserialize)]
-pub struct MetricsConfig {
-    #[serde(default)]
-    pub enabled: bool,
-    #[serde(default = "default_metrics_address")]
-    pub address: String,
-    #[serde(default = "default_metrics_port")]
-    pub port: u16,
-}
-
-fn default_metrics_address() -> String {
-    "0.0.0.0".to_string()
-}
-
-fn default_metrics_port() -> u16 {
-    9090
-}
-
-impl Default for MetricsConfig {
-    fn default() -> Self {
-        Self {
-            enabled: false,
-            address: default_metrics_address(),
-            port: default_metrics_port(),
         }
     }
 }
@@ -171,7 +144,7 @@ pub struct ServerConfig {
     #[serde(default)]
     pub auth: AuthConfig,
     #[serde(default)]
-    pub metrics: MetricsConfig,
+    pub otel: OtelConfig,
     #[serde(default)]
     pub tls: TlsConfig,
     #[serde(rename = "global-connection-types")]
