@@ -18,7 +18,7 @@ arrow = { workspace = true }
 arrow-flight = { workspace = true, features = ["flight-sql"] }
 commons = { workspace = true }
 pg-meta-store = { workspace = true }
-tonic = { workspace = true }
+tonic = { workspace = true, features = ["tls-aws-lc"] }
 config = { workspace = true }
 anyhow = { workspace = true }
 serde = { workspace = true }
@@ -27,6 +27,7 @@ kube-utils = { workspace = true }
 tokio = { workspace = true }
 url = { workspace = true }
 chrono = { workspace = true }
+rustls = { workspace = true }
 
 
 [dev-dependencies]

@@ -17,3 +17,7 @@ data:
     [flight-service]
     address = "flight-service"
     port = 50051
+
+    [flight-service.tls]
+    ca_cert_file = "/etc/flight-service-tls/ca.crt"
+    server_name = "flight-service"

@@ -1,7 +1,7 @@
 use actix_web::body::MessageBody;
 use actix_web::dev::{ServiceRequest, ServiceResponse};
 use actix_web::middleware::Next;
-use actix_web::{HttpMessage, HttpResponse};
+use actix_web::{HttpMessage, HttpResponse, http::header::AUTHORIZATION};
 
 use super::endpoints::ApiContext;
 use super::errors::EndpointError;
@@ -42,7 +42,16 @@ pub async fn validate_headers(
         },
     };
 
-    req.extensions_mut().insert(ApiContext { tenant_id });
+    let authorization = req
+        .headers()
+        .get(AUTHORIZATION)
+        .and_then(|value| value.to_str().ok())
+        .map(str::to_owned);
+
+    req.extensions_mut().insert(ApiContext {
+        tenant_id,
+        authorization,
+    });
 
     next.call(req).await.map(ServiceResponse::map_into_left_body)
 }

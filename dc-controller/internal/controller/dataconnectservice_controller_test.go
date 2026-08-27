@@ -213,6 +213,14 @@ var _ = Describe("DataConnectService Controller", func() {
 			Expect(flightSvc.Spec.Ports[0].Port).To(Equal(int32(50051)))
 		})
 
+		It("should configure REST to verify the generated Flight service name", func() {
+			reconcileUntilReady()
+
+			cm := &corev1.ConfigMap{}
+			Expect(k8sClient.Get(ctx, types.NamespacedName{Name: np + nameRestService + "-config", Namespace: targetNamespace}, cm)).To(Succeed())
+			Expect(cm.Data["config.toml"]).To(ContainSubstring(`server_name = "` + np + nameFlightService + `"`))
+		})
+
 		It("should set PlatformObject status fields", func() {
 			reconcileUntilReady()
 

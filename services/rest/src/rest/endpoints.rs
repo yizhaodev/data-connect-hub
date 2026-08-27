@@ -5,7 +5,7 @@ use crate::clients::flight::FlightClient;
 use crate::rest::update_connection_type_status;
 use crate::state::audit::audit_data_connection_types;
 use crate::utils::transform_data_connection;
-use actix_web::{HttpResponse, web};
+use actix_web::{HttpRequest, HttpResponse, http::header::AUTHORIZATION, web};
 use chrono::Utc;
 use commons::api::connection_types::DataConnectionType;
 use commons::api::connections::{DataConnection, DataConnectionState, DataConnectionStatus};
@@ -19,6 +19,7 @@ use tracing::info;
 #[derive(Clone)]
 pub struct ApiContext {
     pub tenant_id: String,
+    pub authorization: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -165,7 +166,13 @@ pub async fn create_connection_type(
         .create_data_connection_type(ctx.tenant_id.as_str(), &connection_type)
         .await?;
 
-    update_connection_type_status(&service.flight_client, &service.meta_store, connection_type.clone()).await?;
+    update_connection_type_status(
+        &service.flight_client,
+        &service.meta_store,
+        connection_type.clone(),
+        ctx.authorization.as_deref(),
+    )
+    .await?;
 
     Ok(HttpResponse::Created().json(connection_type))
 }
@@ -192,7 +199,13 @@ pub async fn patch_connection_type(
         .update_data_connection_type(ctx.tenant_id.as_str(), id.as_str(), update_fn)
         .await?;
 
-    update_connection_type_status(&service.flight_client, &service.meta_store, connection_type.clone()).await?;
+    update_connection_type_status(
+        &service.flight_client,
+        &service.meta_store,
+        connection_type.clone(),
+        ctx.authorization.as_deref(),
+    )
+    .await?;
 
     Ok(HttpResponse::Ok().json(connection_type))
 }
@@ -231,9 +244,16 @@ pub async fn get_ingestion_data(
     Err(EndpointError::Unimplemented.into())
 }
 
-pub async fn audit_connection_types(service: web::Data<ApiService>) -> Result<HttpResponse, RestErrorResponse> {
+pub async fn audit_connection_types(
+    service: web::Data<ApiService>,
+    request: HttpRequest,
+) -> Result<HttpResponse, RestErrorResponse> {
     info!("audit_connection_types");
-    audit_data_connection_types(service.meta_store.clone(), &service.flight_client).await?;
+    let authorization = request
+        .headers()
+        .get(AUTHORIZATION)
+        .and_then(|value| value.to_str().ok());
+    audit_data_connection_types(service.meta_store.clone(), &service.flight_client, authorization).await?;
     Ok(HttpResponse::Accepted().finish())
 }
 
@@ -248,7 +268,7 @@ pub async fn check_existent_connection(
 
     let result = service
         .flight_client
-        .check_connection(&ctx.tenant_id, &connection_id)
+        .check_connection(&ctx.tenant_id, &connection_id, ctx.authorization.as_deref())
         .await;
 
     match result {
@@ -299,7 +319,7 @@ pub async fn test_credentials(
 
     service
         .flight_client
-        .test_credentials(&ctx.tenant_id, &body)
+        .test_credentials(&ctx.tenant_id, &body, ctx.authorization.as_deref())
         .await
         .map_err(|e| ValidationError::ConnectionCheckFailed(e.message().to_string()))?;
 
@@ -614,7 +634,7 @@ mod tests {
         web::Data::new(ApiService::new(
             Arc::new(StubMetaStore),
             Arc::new(StubSecretStore),
-            FlightClient::new("http://localhost:50051".to_string()),
+            FlightClient::new("http://localhost:50051".to_string(), Default::default()),
         ))
     }
 

@@ -56,11 +56,15 @@ pub async fn verify_data_connection(
 pub async fn audit_data_connection_types(
     meta_store: Arc<dyn MetaStore + Send + Sync>,
     flight_client: &FlightClient,
+    authorization: Option<&str>,
 ) -> Result<(), ValidationError> {
-    let supported = flight_client.get_supported_connectors().await.map_err(|e| {
-        tracing::error!(error = %e, "failed to get supported connectors from flight service");
-        ValidationError::FlightServiceError(e.to_string())
-    })?;
+    let supported = flight_client
+        .get_supported_connectors(authorization)
+        .await
+        .map_err(|e| {
+            tracing::error!(error = %e, "failed to get supported connectors from flight service");
+            ValidationError::FlightServiceError(e.to_string())
+        })?;
 
     let supported_names: Vec<&str> = supported.iter().map(|c| c.name.as_str()).collect();
 
