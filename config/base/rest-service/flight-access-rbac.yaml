@@ -1,0 +1,24 @@
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: rest-to-flight-access
+  labels:
+    app.kubernetes.io/name: rest-service
+    app.kubernetes.io/part-of: data-connect-hub
+rules:
+  - apiGroups: ["dataconnecthub.opendatahub.io"]
+    resources: ["data-connections", "data-connection-types"]
+    verbs: ["get", "create"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: rest-to-flight-access
+subjects:
+  - kind: ServiceAccount
+    name: data-connect-hub-sa
+    namespace: opendatahub
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: rest-to-flight-access
