@@ -100,6 +100,11 @@ def pg_secret() -> str | None:
 
 
 @pytest.fixture(scope="session")
+def tenant_pg_url() -> str | None:
+    return os.environ.get("DCH_TENANT_PG_URL") or None
+
+
+@pytest.fixture(scope="session")
 def s3_secret() -> str | None:
     return os.environ.get("DCH_S3_SECRET") or None
 
