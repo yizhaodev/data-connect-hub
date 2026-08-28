@@ -17,11 +17,26 @@ pub struct Server {
 pub struct FlightService {
     pub address: String,
     pub port: u16,
+    #[serde(default)]
+    pub tls: FlightServiceTls,
+}
+
+#[derive(Debug, Deserialize, Clone, Default)]
+pub struct FlightServiceTls {
+    /// PEM certificate used as the trust anchor for the Flight server.
+    pub ca_cert_file: Option<String>,
+    /// TLS server name to verify. Defaults to the endpoint host when omitted.
+    pub server_name: Option<String>,
 }
 
 impl FlightService {
     pub fn endpoint(&self) -> String {
-        format!("http://{}:{}", self.address, self.port)
+        let scheme = if self.tls.ca_cert_file.is_some() {
+            "https"
+        } else {
+            "http"
+        };
+        format!("{scheme}://{}:{}", self.address, self.port)
     }
 }
 
@@ -95,6 +110,42 @@ mod tests {
         assert_eq!(server_config.server.port, 8080);
         assert_eq!(server_config.flight_service.address, "127.0.0.1");
         assert_eq!(server_config.flight_service.port, 50051);
+        assert_eq!(server_config.flight_service.endpoint(), "http://127.0.0.1:50051");
+    }
+
+    #[test]
+    fn test_flight_service_tls_config_uses_https() {
+        let toml_str = r#"
+            [database]
+            url = "postgresql://user:pass@localhost:5432/db"
+
+            [server]
+            address = "127.0.0.1"
+            port = 8080
+
+            [global-connection-types]
+            tenant-id = "opendatahub"
+
+            [flight-service]
+            address = "flight-service"
+            port = 50051
+
+            [flight-service.tls]
+            ca_cert_file = "/etc/flight-service-tls/ca.crt"
+            server_name = "flight-service"
+        "#;
+
+        let config = Config::builder()
+            .add_source(config::File::from_str(toml_str, config::FileFormat::Toml))
+            .build()
+            .unwrap();
+
+        let server_config: ServerConfig = config.try_deserialize().unwrap();
+        assert_eq!(server_config.flight_service.endpoint(), "https://flight-service:50051");
+        assert_eq!(
+            server_config.flight_service.tls.server_name.as_deref(),
+            Some("flight-service")
+        );
     }
 
     #[test]

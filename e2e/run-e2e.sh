@@ -70,6 +70,7 @@ DCH_TENANT_URI="${DCH_TENANT_URI:-}"
 E2E_SA_NAME="e2e-user"
 E2E_DENIED_SA_NAME="e2e-denied-user"
 PG_SECRET="e2e-pg-creds"
+PG_BAD_SECRET="e2e-pg-bad-creds"
 S3_SECRET="e2e-s3-creds"
 MILVUS_SECRET="e2e-milvus-creds"
 ES_SECRET="e2e-es-creds"
@@ -115,6 +116,10 @@ setup_pg_secret() {
         kubectl create secret generic "$PG_SECRET" \
             -n "$DCH_TENANT_ID" \
             --from-literal="URI=${PG_INTERNAL_URL}" \
+            --dry-run=client -o yaml | kubectl apply -f - >/dev/null
+        kubectl create secret generic "$PG_BAD_SECRET" \
+            -n "$DCH_TENANT_ID" \
+            --from-literal="URI=postgresql://e2e:wrong-password@127.0.0.1:1/nope" \
             --dry-run=client -o yaml | kubectl apply -f - >/dev/null
         E2E_PG_ENABLED="true"
     fi
@@ -258,6 +263,7 @@ setup_uri_server_and_secret() {
 setup_flight_secret_rbac() {
     local -a secret_names=()
     [[ "$E2E_PG_ENABLED" == "true" ]] && secret_names+=("--resource-name=$PG_SECRET")
+    [[ "$E2E_PG_ENABLED" == "true" ]] && secret_names+=("--resource-name=$PG_BAD_SECRET")
     [[ "$E2E_S3_ENABLED" == "true" ]] && secret_names+=("--resource-name=$S3_SECRET")
     [[ "$E2E_MILVUS_ENABLED" == "true" ]] && secret_names+=("--resource-name=$MILVUS_SECRET")
     [[ "$E2E_ES_ENABLED" == "true" ]] && secret_names+=("--resource-name=$ES_SECRET")
@@ -354,6 +360,7 @@ EOF
 
     if [[ "$E2E_PG_ENABLED" == "true" ]]; then
         echo "DCH_PG_SECRET=${PG_SECRET}" >> "$ENV_FILE"
+        echo "DCH_PG_BAD_SECRET=${PG_BAD_SECRET}" >> "$ENV_FILE"
     fi
 
     [[ -n "${DCH_FLIGHT_METRICS_URL:-}" ]] && \

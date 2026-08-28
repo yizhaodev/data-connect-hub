@@ -308,6 +308,9 @@ func setConfigMapFlightServiceAddress(resources []*unstructured.Unstructured) {
 		data["config.toml"] = strings.ReplaceAll(toml,
 			`address = "flight-service"`,
 			fmt.Sprintf(`address = "%s"`, flightSvcName))
+		data["config.toml"] = strings.ReplaceAll(data["config.toml"],
+			`server_name = "flight-service"`,
+			fmt.Sprintf(`server_name = "%s"`, flightSvcName))
 		_ = unstructured.SetNestedStringMap(obj.Object, data, "data")
 	}
 }

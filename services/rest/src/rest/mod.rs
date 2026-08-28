@@ -15,8 +15,9 @@ pub(crate) async fn update_connection_type_status(
     flight_client: &FlightClient,
     meta_store: &Arc<dyn MetaStore + Send + Sync>,
     connection_type: DataConnectionTypeResource,
+    authorization: Option<&str>,
 ) -> Result<(), RestErrorResponse> {
-    let connectors = flight_client.get_supported_connectors().await;
+    let connectors = flight_client.get_supported_connectors(authorization).await;
 
     if let Ok(connectors) = connectors {
         let names: Vec<String> = connectors.into_iter().map(|c| c.name).collect();
