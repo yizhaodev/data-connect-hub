@@ -8,7 +8,7 @@ use commons::api::{X_DATA_CONNECTION_ID, X_TENANT_ID};
 use std::sync::Arc;
 use tokio::sync::OnceCell;
 use tonic::metadata::MetadataValue;
-use tonic::transport::Channel;
+use tonic::transport::{Channel, ClientTlsConfig};
 
 #[derive(Debug, Clone)]
 pub struct SupportedConnector {
@@ -19,13 +19,15 @@ pub struct SupportedConnector {
 
 pub struct FlightClient {
     endpoint: String,
+    tls_config: Option<ClientTlsConfig>,
     client: OnceCell<FlightServiceClient<Channel>>,
 }
 
 impl FlightClient {
-    pub fn new(endpoint: String) -> Self {
+    pub fn new(endpoint: String, tls_config: Option<ClientTlsConfig>) -> Self {
         Self {
             endpoint,
+            tls_config,
             client: OnceCell::new(),
         }
     }
@@ -33,8 +35,14 @@ impl FlightClient {
     async fn client(&self) -> Result<FlightServiceClient<Channel>, tonic::Status> {
         self.client
             .get_or_try_init(|| async {
-                let channel = Channel::from_shared(self.endpoint.clone())
-                    .map_err(|e| tonic::Status::internal(format!("invalid flight endpoint: {e}")))?
+                let mut channel = Channel::from_shared(self.endpoint.clone())
+                    .map_err(|e| tonic::Status::internal(format!("invalid flight endpoint: {e}")))?;
+                if let Some(tls) = &self.tls_config {
+                    channel = channel
+                        .tls_config(tls.clone())
+                        .map_err(|e| tonic::Status::internal(format!("flight TLS config error: {e}")))?;
+                }
+                let channel = channel
                     .connect()
                     .await
                     .map_err(|e| tonic::Status::unavailable(format!("failed to connect to flight service: {e}")))?;

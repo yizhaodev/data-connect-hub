@@ -17,3 +17,6 @@ data:
     [flight-service]
     address = "flight-service"
     port = 8443
+
+    [flight-service.tls]
+    ca_cert_file = "/etc/service-ca/service-ca.crt"

@@ -155,6 +155,10 @@ fn log_config_source(config_file: &str, source: &str, required: bool) {
 
 #[actix_web::main]
 async fn main() -> Result<()> {
+    rustls::crypto::aws_lc_rs::default_provider()
+        .install_default()
+        .expect("Failed to install rustls CryptoProvider");
+
     let args = CommandLineArgs::parse();
     let config = Arc::new(load_config(args.config.clone(), args.secret_config.clone())?);
 
@@ -173,7 +177,20 @@ async fn main() -> Result<()> {
     let meta_store: Arc<dyn MetaStore + Send + Sync> = pg_meta_store.clone();
 
     let secret_store = KubeSecretStore::try_default(Duration::from_secs(300)).await?;
-    let flight_client = FlightClient::new(config.flight_service.endpoint());
+
+    let tls_config = if let Some(tls_cfg) = &config.flight_service.tls {
+        let ca_cert = tokio::fs::read(&tls_cfg.ca_cert_file).await?;
+        tracing::info!("Flight client TLS enabled (CA: {})", tls_cfg.ca_cert_file);
+        Some(
+            tonic::transport::ClientTlsConfig::new()
+                .ca_certificate(tonic::transport::Certificate::from_pem(ca_cert))
+                .domain_name(&config.flight_service.address),
+        )
+    } else {
+        tracing::warn!("Flight client TLS is DISABLED — gRPC traffic to flight-service is unencrypted");
+        None
+    };
+    let flight_client = FlightClient::new(config.flight_service.endpoint(), tls_config);
 
     let service = Arc::new(ApiService::new(meta_store, Arc::new(secret_store), flight_client));
 

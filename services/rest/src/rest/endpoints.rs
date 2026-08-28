@@ -614,7 +614,7 @@ mod tests {
         web::Data::new(ApiService::new(
             Arc::new(StubMetaStore),
             Arc::new(StubSecretStore),
-            FlightClient::new("http://localhost:50051".to_string()),
+            FlightClient::new("http://localhost:50051".to_string(), None),
         ))
     }
 

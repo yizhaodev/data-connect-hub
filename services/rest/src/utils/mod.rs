@@ -14,14 +14,21 @@ pub struct Server {
 }
 
 #[derive(Debug, Deserialize, Clone)]
+pub struct FlightServiceTls {
+    pub ca_cert_file: String,
+}
+
+#[derive(Debug, Deserialize, Clone)]
 pub struct FlightService {
     pub address: String,
     pub port: u16,
+    pub tls: Option<FlightServiceTls>,
 }
 
 impl FlightService {
     pub fn endpoint(&self) -> String {
-        format!("http://{}:{}", self.address, self.port)
+        let scheme = if self.tls.is_some() { "https" } else { "http" };
+        format!("{scheme}://{}:{}", self.address, self.port)
     }
 }
 

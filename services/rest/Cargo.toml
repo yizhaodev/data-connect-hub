@@ -18,7 +18,8 @@ arrow = { workspace = true }
 arrow-flight = { workspace = true, features = ["flight-sql"] }
 commons = { workspace = true }
 pg-meta-store = { workspace = true }
-tonic = { workspace = true }
+tonic = { workspace = true, features = ["tls-aws-lc"] }
+rustls = { workspace = true }
 config = { workspace = true }
 anyhow = { workspace = true }
 serde = { workspace = true }

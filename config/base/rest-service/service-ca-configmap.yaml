@@ -1,0 +1,9 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: rest-service-ca-bundle
+  labels:
+    app.kubernetes.io/name: rest-service
+    app.kubernetes.io/part-of: data-connect-hub
+  annotations:
+    service.beta.openshift.io/inject-cabundle: "true"

@@ -100,6 +100,9 @@ spec:
             - name: db-secret
               mountPath: /secrets
               readOnly: true
+            - name: service-ca
+              mountPath: /etc/service-ca
+              readOnly: true
           readinessProbe:
             httpGet:
               path: /api/v1/data/health
@@ -128,3 +131,6 @@ spec:
             items:
               - key: secret-config.toml
                 path: secret-config.toml
+        - name: service-ca
+          configMap:
+            name: rest-service-ca-bundle

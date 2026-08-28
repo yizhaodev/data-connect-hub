@@ -9,3 +9,4 @@ resources:
   - kube-rbac-proxy-auth-review-rbac.yaml
   - service_account.yaml
   - networkpolicy.yaml
+  - service-ca-configmap.yaml
