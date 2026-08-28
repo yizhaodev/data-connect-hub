@@ -17,19 +17,44 @@ pub struct SupportedConnector {
     pub description: String,
 }
 
+const AUTHORIZATION_KEY: &str = "authorization";
+
 pub struct FlightClient {
     endpoint: String,
     tls_config: Option<ClientTlsConfig>,
+    sa_token_file: Option<String>,
     client: OnceCell<FlightServiceClient<Channel>>,
 }
 
 impl FlightClient {
-    pub fn new(endpoint: String, tls_config: Option<ClientTlsConfig>) -> Self {
+    pub fn new(endpoint: String, tls_config: Option<ClientTlsConfig>, sa_token_file: Option<String>) -> Self {
         Self {
             endpoint,
             tls_config,
+            sa_token_file,
             client: OnceCell::new(),
         }
+    }
+
+    async fn read_sa_token(&self) -> Result<Option<String>, tonic::Status> {
+        let Some(path) = &self.sa_token_file else {
+            return Ok(None);
+        };
+        let token = tokio::fs::read_to_string(path)
+            .await
+            .map_err(|e| tonic::Status::internal(format!("failed to read SA token from {path}: {e}")))?;
+        Ok(Some(token.trim().to_string()))
+    }
+
+    fn set_auth(metadata: &mut tonic::metadata::MetadataMap, token: &Option<String>) -> Result<(), tonic::Status> {
+        if let Some(token) = token {
+            metadata.insert(
+                AUTHORIZATION_KEY,
+                MetadataValue::try_from(format!("Bearer {token}"))
+                    .map_err(|_| tonic::Status::internal("invalid SA token"))?,
+            );
+        }
+        Ok(())
     }
 
     async fn client(&self) -> Result<FlightServiceClient<Channel>, tonic::Status> {
@@ -54,9 +79,12 @@ impl FlightClient {
 
     pub async fn get_supported_connectors(&self) -> Result<Vec<SupportedConnector>, tonic::Status> {
         let mut client = self.client().await?;
-        let action = Action::new("GetSupportedConnectors", "");
+        let token = self.read_sa_token().await?;
 
-        let mut stream = client.do_action(action).await?.into_inner();
+        let mut request = tonic::Request::new(Action::new("GetSupportedConnectors", ""));
+        Self::set_auth(request.metadata_mut(), &token)?;
+
+        let mut stream = client.do_action(request).await?.into_inner();
         let result = stream
             .message()
             .await?
@@ -97,8 +125,11 @@ impl FlightClient {
 
     pub async fn check_connection(&self, tenant_id: &str, connection_id: &str) -> Result<(), tonic::Status> {
         let mut client = self.client().await?;
+        let token = self.read_sa_token().await?;
+
         let mut request = tonic::Request::new(Action::new("CheckConnection", ""));
         let metadata = request.metadata_mut();
+        Self::set_auth(metadata, &token)?;
         metadata.insert(
             X_TENANT_ID,
             MetadataValue::try_from(tenant_id).map_err(|_| tonic::Status::invalid_argument("invalid tenant_id"))?,
@@ -141,8 +172,12 @@ impl FlightClient {
         }
 
         let mut client = self.client().await?;
+        let token = self.read_sa_token().await?;
+
         let mut request = tonic::Request::new(Action::new("CheckConnection", buf));
-        request.metadata_mut().insert(
+        let metadata = request.metadata_mut();
+        Self::set_auth(metadata, &token)?;
+        metadata.insert(
             X_TENANT_ID,
             MetadataValue::try_from(tenant_id).map_err(|_| tonic::Status::invalid_argument("invalid tenant_id"))?,
         );

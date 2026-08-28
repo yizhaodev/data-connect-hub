@@ -23,6 +23,7 @@ pub struct FlightService {
     pub address: String,
     pub port: u16,
     pub tls: Option<FlightServiceTls>,
+    pub sa_token_file: Option<String>,
 }
 
 impl FlightService {

@@ -190,7 +190,11 @@ async fn main() -> Result<()> {
         tracing::warn!("Flight client TLS is DISABLED — gRPC traffic to flight-service is unencrypted");
         None
     };
-    let flight_client = FlightClient::new(config.flight_service.endpoint(), tls_config);
+    let flight_client = FlightClient::new(
+        config.flight_service.endpoint(),
+        tls_config,
+        config.flight_service.sa_token_file.clone(),
+    );
 
     let service = Arc::new(ApiService::new(meta_store, Arc::new(secret_store), flight_client));
 
