@@ -282,7 +282,7 @@ func setDeploymentImage(resources []*unstructured.Unstructured, containerName, i
 	}
 }
 
-func setConfigMapFlightServiceAddress(resources []*unstructured.Unstructured) {
+func setConfigMapFlightServiceAddress(resources []*unstructured.Unstructured, namespace string) {
 	var flightSvcName string
 	for _, obj := range resources {
 		if obj.GetKind() == "Service" && strings.HasSuffix(obj.GetName(), nameFlightService) {
@@ -293,6 +293,7 @@ func setConfigMapFlightServiceAddress(resources []*unstructured.Unstructured) {
 	if flightSvcName == "" {
 		return
 	}
+	flightSvcFQDN := fmt.Sprintf("%s.%s.svc", flightSvcName, namespace)
 	for _, obj := range resources {
 		if obj.GetKind() != kindConfigMap {
 			continue
@@ -307,7 +308,7 @@ func setConfigMapFlightServiceAddress(resources []*unstructured.Unstructured) {
 		}
 		data["config.toml"] = strings.ReplaceAll(toml,
 			`address = "flight-service"`,
-			fmt.Sprintf(`address = "%s"`, flightSvcName))
+			fmt.Sprintf(`address = "%s"`, flightSvcFQDN))
 		_ = unstructured.SetNestedStringMap(obj.Object, data, "data")
 	}
 }

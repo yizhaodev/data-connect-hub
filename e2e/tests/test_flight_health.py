@@ -40,8 +40,11 @@ def _authority_from_server_cert(cert_pem: str) -> str | None:
         Path(cert_path).unlink(missing_ok=True)
 
     for entry_type, entry_value in decoded.get("subjectAltName", []):
-        if entry_type == "DNS":
+        if entry_type == "DNS" and not entry_value.startswith("*"):
             return entry_value
+    for entry_type, entry_value in decoded.get("subjectAltName", []):
+        if entry_type == "DNS" and entry_value.startswith("*."):
+            return "x-grpc-health" + entry_value[1:]
     return None
 
 
@@ -53,7 +56,6 @@ def _build_channel(gateway_endpoint: str, insecure: bool, ca_cert: str | None) -
     if ca_cert:
         root_certs = Path(ca_cert).read_bytes()
     elif insecure:
-        # Trust the presented cert directly for self-signed local setups.
         cert_pem = ssl.get_server_certificate((host, port))
         root_certs = cert_pem.encode("utf-8")
 

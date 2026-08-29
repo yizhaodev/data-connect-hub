@@ -180,11 +180,16 @@ async fn main() -> Result<()> {
 
     let tls_config = if let Some(tls_cfg) = &config.flight_service.tls {
         let ca_cert = tokio::fs::read(&tls_cfg.ca_cert_file).await?;
-        tracing::info!("Flight client TLS enabled (CA: {})", tls_cfg.ca_cert_file);
+        let domain = tls_cfg.domain_name.as_deref().unwrap_or(&config.flight_service.address);
+        tracing::info!(
+            "Flight client TLS enabled (CA: {}, domain: {})",
+            tls_cfg.ca_cert_file,
+            domain
+        );
         Some(
             tonic::transport::ClientTlsConfig::new()
                 .ca_certificate(tonic::transport::Certificate::from_pem(ca_cert))
-                .domain_name(&config.flight_service.address),
+                .domain_name(domain),
         )
     } else {
         tracing::warn!("Flight client TLS is DISABLED — gRPC traffic to flight-service is unencrypted");

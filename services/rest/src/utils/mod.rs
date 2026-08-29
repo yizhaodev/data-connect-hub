@@ -16,6 +16,7 @@ pub struct Server {
 #[derive(Debug, Deserialize, Clone)]
 pub struct FlightServiceTls {
     pub ca_cert_file: String,
+    pub domain_name: Option<String>,
 }
 
 #[derive(Debug, Deserialize, Clone)]
