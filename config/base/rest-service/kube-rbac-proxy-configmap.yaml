@@ -20,7 +20,7 @@ data:
                     namespace: "{{.FromHeader}}"
                     apiGroup: dataconnecthub.opendatahub.io
                     resource: data-connections
-                    verb: create
+                    verb: get
         - path: /api/v1/data/connections/*
           mappings:
             - methods: [get, post, patch, delete]
@@ -80,4 +80,4 @@ data:
                     namespace: "{{.FromHeader}}"
                     apiGroup: dataconnecthub.opendatahub.io
                     resource: data-connections
-                    verb: create
+                    verb: get
