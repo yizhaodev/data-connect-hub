@@ -319,15 +319,15 @@ func httpRouteResourceName(crName string) string {
 }
 
 func renderFlightService(resources []*unstructured.Unstructured, crName string) []*unstructured.Unstructured {
-	serviceName := flightServiceResourceName(crName)
+	newName := flightServiceResourceName(crName)
 	for _, obj := range resources {
 		if isFlightServiceResource(obj) {
-			renameFlightServiceResource(obj, serviceName)
+			renameFlightServiceResource(obj, nameFlightService, newName)
 			continue
 		}
 		if obj.GetKind() == kindHTTPRoute {
 			obj.SetName(httpRouteResourceName(crName))
-			obj.Object = replaceStringValue(obj.UnstructuredContent(), nameFlightService, serviceName).(map[string]any)
+			renameHTTPRouteBackendRefs(obj, nameFlightService, newName)
 		}
 	}
 	return resources
@@ -351,28 +351,151 @@ func isFlightServiceResource(obj *unstructured.Unstructured) bool {
 	}
 }
 
-func renameFlightServiceResource(obj *unstructured.Unstructured, serviceName string) {
-	content := replaceStringValue(obj.UnstructuredContent(), nameFlightService, serviceName).(map[string]any)
-	obj.Object = content
-	if obj.GetKind() == kindClusterRoleBinding {
-		obj.SetName(strings.Replace(obj.GetName(), "flight-auth-delegator", serviceName+"-auth-delegator", 1))
+func renameFlightServiceResource(obj *unstructured.Unstructured, oldName, newName string) {
+	obj.SetName(strings.Replace(obj.GetName(), oldName, newName, 1))
+
+	labels := obj.GetLabels()
+	if v, ok := labels[labelAppName]; ok && strings.Contains(v, oldName) {
+		labels[labelAppName] = strings.Replace(v, oldName, newName, 1)
+		obj.SetLabels(labels)
+	}
+
+	switch obj.GetKind() {
+	case kindDeployment:
+		renameDeploymentRefs(obj, oldName, newName)
+	case kindService:
+		renameServiceRefs(obj, oldName, newName)
+	case kindNetworkPolicy:
+		renameNetworkPolicyRefs(obj, oldName, newName)
+	case kindClusterRoleBinding:
+		renameCRBRefs(obj, oldName, newName)
 	}
 }
 
-func replaceStringValue(value any, old, new string) any {
-	switch value := value.(type) {
-	case string:
-		return strings.ReplaceAll(value, old, new)
-	case map[string]any:
-		for key, child := range value {
-			value[key] = replaceStringValue(child, old, new)
+func renameDeploymentRefs(obj *unstructured.Unstructured, oldName, newName string) {
+	replaceNestedLabel(obj, labelAppName, oldName, newName,
+		"spec", "selector", "matchLabels")
+	replaceNestedLabel(obj, labelAppName, oldName, newName,
+		"spec", "template", "metadata", "labels")
+	replaceNestedString(obj, oldName, newName,
+		"spec", "template", "spec", "serviceAccountName")
+	renameVolumes(obj, oldName, newName)
+}
+
+func renameServiceRefs(obj *unstructured.Unstructured, oldName, newName string) {
+	replaceNestedLabel(obj, labelAppName, oldName, newName, "spec", "selector")
+
+	ann := obj.GetAnnotations()
+	if ann == nil {
+		return
+	}
+	const certSecretKey = "service.beta.openshift.io/serving-cert-secret-name"
+	if v, ok := ann[certSecretKey]; ok && strings.Contains(v, oldName) {
+		ann[certSecretKey] = strings.Replace(v, oldName, newName, 1)
+		obj.SetAnnotations(ann)
+	}
+}
+
+func renameNetworkPolicyRefs(obj *unstructured.Unstructured, oldName, newName string) {
+	replaceNestedLabel(obj, labelAppName, oldName, newName,
+		"spec", "podSelector", "matchLabels")
+}
+
+func renameCRBRefs(obj *unstructured.Unstructured, oldName, newName string) {
+	obj.SetName(strings.Replace(obj.GetName(),
+		"flight-auth-delegator", newName+"-auth-delegator", 1))
+
+	subjects, found, _ := unstructured.NestedSlice(obj.Object, "subjects")
+	if !found {
+		return
+	}
+	for i, s := range subjects {
+		sub, ok := s.(map[string]any)
+		if !ok {
+			continue
 		}
-	case []any:
-		for i, child := range value {
-			value[i] = replaceStringValue(child, old, new)
+		if name, _ := sub["name"].(string); strings.Contains(name, oldName) {
+			sub["name"] = strings.Replace(name, oldName, newName, 1)
+			subjects[i] = sub
 		}
 	}
-	return value
+	_ = unstructured.SetNestedSlice(obj.Object, subjects, "subjects")
+}
+
+func renameHTTPRouteBackendRefs(obj *unstructured.Unstructured, oldName, newName string) {
+	rules, found, _ := unstructured.NestedSlice(obj.Object, "spec", "rules")
+	if !found {
+		return
+	}
+	for i, rule := range rules {
+		r, ok := rule.(map[string]any)
+		if !ok {
+			continue
+		}
+		refs, _ := r["backendRefs"].([]any)
+		for j, ref := range refs {
+			br, ok := ref.(map[string]any)
+			if !ok {
+				continue
+			}
+			if name, _ := br["name"].(string); strings.Contains(name, oldName) {
+				br["name"] = strings.Replace(name, oldName, newName, 1)
+				refs[j] = br
+			}
+		}
+		r["backendRefs"] = refs
+		rules[i] = r
+	}
+	_ = unstructured.SetNestedSlice(obj.Object, rules, "spec", "rules")
+}
+
+func replaceNestedLabel(obj *unstructured.Unstructured, labelKey, oldName, newName string, fields ...string) {
+	labels, found, _ := unstructured.NestedStringMap(obj.Object, fields...)
+	if !found {
+		return
+	}
+	if v, ok := labels[labelKey]; ok && strings.Contains(v, oldName) {
+		labels[labelKey] = strings.Replace(v, oldName, newName, 1)
+		_ = unstructured.SetNestedStringMap(obj.Object, labels, fields...)
+	}
+}
+
+func replaceNestedString(obj *unstructured.Unstructured, oldName, newName string, fields ...string) {
+	val, found, _ := unstructured.NestedString(obj.Object, fields...)
+	if found && strings.Contains(val, oldName) {
+		_ = unstructured.SetNestedField(obj.Object,
+			strings.Replace(val, oldName, newName, 1), fields...)
+	}
+}
+
+func renameVolumes(obj *unstructured.Unstructured, oldName, newName string) {
+	volumes, found, _ := unstructured.NestedSlice(obj.Object,
+		"spec", "template", "spec", "volumes")
+	if !found {
+		return
+	}
+	for i, v := range volumes {
+		vol, ok := v.(map[string]any)
+		if !ok {
+			continue
+		}
+		if cm, ok := vol["configMap"].(map[string]any); ok {
+			if name, _ := cm["name"].(string); strings.Contains(name, oldName) {
+				cm["name"] = strings.Replace(name, oldName, newName, 1)
+				vol["configMap"] = cm
+				volumes[i] = vol
+			}
+		}
+		if sec, ok := vol["secret"].(map[string]any); ok {
+			if name, _ := sec["secretName"].(string); strings.Contains(name, oldName) {
+				sec["secretName"] = strings.Replace(name, oldName, newName, 1)
+				vol["secret"] = sec
+				volumes[i] = vol
+			}
+		}
+	}
+	_ = unstructured.SetNestedSlice(obj.Object, volumes,
+		"spec", "template", "spec", "volumes")
 }
 
 func setConfigMapFlightServiceAddress(resources []*unstructured.Unstructured, namespace, serviceName string) error {
