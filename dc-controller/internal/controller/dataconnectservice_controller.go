@@ -401,18 +401,25 @@ func (r *DataConnectServiceReconciler) reconcileManifests(
 	patches = append(patches, flightPatches...)
 	patches = append(patches, gwPatches...)
 
+	flightInstanceName := flightInstanceName(cr.Name)
+	flightResourceName := resourceNamePrefix + flightInstanceName
+
 	paramsEnvOverrides := map[string]string{
-		RelatedImageRestService:   r.RestImage,
-		RelatedImageFlightService: r.FlightImage,
-		RelatedImageKubeRbacProxy: r.KubeRbacProxyImage,
+		ParamRestImage:           r.RestImage,
+		ParamFlightImage:         r.FlightImage,
+		ParamKubeRbacProxyImage:  r.KubeRbacProxyImage,
+		ParamFlightResourceName:  flightResourceName,
+		ParamFlightInstanceName:  flightInstanceName,
+		ParamFlightConfigName:    flightResourceName + "-config",
+		ParamFlightSAName:        flightResourceName + "-sa",
+		ParamFlightCRBName:       flightResourceName + "-auth-delegator",
+		ParamFlightTLSName:       flightInstanceName + "-tls",
+		ParamFlightHTTPRouteName: httpRouteResourceName(cr.Name),
 	}
 	resources, err := renderKustomization(r.ManifestsPath, manifestPath, patches, nil, paramsEnvOverrides)
 	if err != nil {
 		return fmt.Errorf("rendering manifests: %w", err)
 	}
-
-	resources = renderFlightService(resources, cr.Name)
-	flightInstanceName := flightServiceResourceName(cr.Name)
 
 	if err := setConfigMapGlobalNamespace(resources, cr.Namespace); err != nil {
 		return fmt.Errorf("setting config namespace: %w", err)
@@ -420,7 +427,7 @@ func (r *DataConnectServiceReconciler) reconcileManifests(
 	if err := setConfigMapDiscoveryServiceAccount(resources, cr.Namespace, flightInstanceName); err != nil {
 		return fmt.Errorf("setting discovery service account: %w", err)
 	}
-	if err := setConfigMapFlightServiceAddress(resources, cr.Namespace, flightInstanceName); err != nil {
+	if err := setConfigMapFlightServiceAddress(resources, cr.Namespace, flightResourceName); err != nil {
 		return fmt.Errorf("setting flight service address: %w", err)
 	}
 	if cr.Spec.FlightService != nil {
@@ -457,12 +464,12 @@ func (r *DataConnectServiceReconciler) registerFlightService(ctx context.Context
 		return nil
 	}
 	log := logf.FromContext(ctx)
-	flightName := flightServiceResourceName(cr.Name)
-	flightFQDN := fmt.Sprintf("dch-%s.%s.svc", flightName, cr.Namespace)
+	flightInstance := flightInstanceName(cr.Name)
+	flightFQDN := fmt.Sprintf("%s%s.%s.svc", resourceNamePrefix, flightInstance, cr.Namespace)
 	internalURL := fmt.Sprintf("https://%s:8443", flightFQDN)
 
 	fs := FlightServiceRegistration{
-		Name:        flightName,
+		Name:        flightInstance,
 		Namespace:   cr.Namespace,
 		ExternalURL: internalURL,
 		InternalURL: internalURL,
@@ -471,16 +478,16 @@ func (r *DataConnectServiceReconciler) registerFlightService(ctx context.Context
 
 	if err := r.FlightServiceClient.RegisterFlightService(ctx, cr.Namespace, fs); err != nil {
 		if errors.Is(err, ErrConflict) {
-			log.V(1).Info("flight service already registered", "name", flightName)
+			log.V(1).Info("flight service already registered", "name", flightInstance)
 			return nil
 		}
 		if errors.Is(err, ErrServiceUnavailable) {
-			log.Info("REST service unavailable for flight registration, requeuing", "name", flightName)
+			log.Info("REST service unavailable for flight registration, requeuing", "name", flightInstance)
 			return err
 		}
-		return fmt.Errorf("registering flight service %s: %w", flightName, err)
+		return fmt.Errorf("registering flight service %s: %w", flightInstance, err)
 	}
-	log.Info("registered flight service", "name", flightName)
+	log.Info("registered flight service", "name", flightInstance)
 	return nil
 }
 

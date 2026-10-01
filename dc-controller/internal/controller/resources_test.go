@@ -248,14 +248,8 @@ func TestSetConfigMapFlightServiceAddress(t *testing.T) {
 	configMap := configMapWithTOML(`[flight-service]
 address = "flight-service"
 `)
-	service := &unstructured.Unstructured{Object: map[string]any{
-		"kind": kindService,
-		"metadata": map[string]any{
-			testNameKey: "dch-default-dcs-flight",
-		},
-	}}
 
-	if err := setConfigMapFlightServiceAddress([]*unstructured.Unstructured{service, configMap}, "test-namespace", "default-dcs-flight"); err != nil {
+	if err := setConfigMapFlightServiceAddress([]*unstructured.Unstructured{configMap}, "test-namespace", "dch-default-dcs-flight"); err != nil {
 		t.Fatal(err)
 	}
 	flightService, ok := parsedConfigMapTOML(t, configMap)["flight-service"].(map[string]any)
@@ -311,10 +305,12 @@ enabled = true
 discovery_service_account = "old-identity"
 `)
 	configMap.SetName("dch-default-dcs-flight-config")
+	configMap.SetLabels(map[string]string{labelAppName: "default-dcs-flight"})
 	serviceAccount := &unstructured.Unstructured{Object: map[string]any{
 		"kind": kindServiceAccount,
 		"metadata": map[string]any{
 			testNameKey: "dch-rest-service-sa",
+			"labels":    map[string]any{labelAppName: nameRestService},
 		},
 	}}
 
@@ -445,9 +441,9 @@ func TestRenderKustomizationImageParams(t *testing.T) {
 	}
 
 	imageParams := map[string]string{
-		RelatedImageRestService:   "registry.example.com/dch/rest@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
-		RelatedImageFlightService: "registry.example.com/dch/flight@sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
-		RelatedImageKubeRbacProxy: "registry.example.com/dch/kube-rbac-proxy@sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+		ParamRestImage:          "registry.example.com/dch/rest@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+		ParamFlightImage:        "registry.example.com/dch/flight@sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+		ParamKubeRbacProxyImage: "registry.example.com/dch/kube-rbac-proxy@sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
 	}
 	paths := []struct {
 		name string
@@ -465,9 +461,9 @@ func TestRenderKustomizationImageParams(t *testing.T) {
 			}
 
 			wantImages := map[string]string{
-				nameRestServiceContainer:   imageParams[RelatedImageRestService],
-				nameFlightServiceContainer: imageParams[RelatedImageFlightService],
-				nameKubeRbacProxy:          imageParams[RelatedImageKubeRbacProxy],
+				nameRestServiceContainer:   imageParams[ParamRestImage],
+				nameFlightServiceContainer: imageParams[ParamFlightImage],
+				nameKubeRbacProxy:          imageParams[ParamKubeRbacProxyImage],
 			}
 			for containerName, wantImage := range wantImages {
 				gotImage, found := renderedContainerImage(resources, containerName)

@@ -49,12 +49,19 @@ import (
 // --- Kustomize rendering ---
 
 const (
-	// RelatedImageRestService is the env var and params.env key for the REST image.
-	RelatedImageRestService = "RELATED_IMAGE_ODH_DATA_CONNECT_HUB_REST_IMAGE"
-	// RelatedImageFlightService is the env var and params.env key for the Flight image.
-	RelatedImageFlightService = "RELATED_IMAGE_ODH_DATA_CONNECT_HUB_FLIGHT_IMAGE"
-	// RelatedImageKubeRbacProxy is the env var and params.env key for the kube-rbac-proxy image.
-	RelatedImageKubeRbacProxy = "RELATED_IMAGE_ODH_KUBE_RBAC_PROXY_IMAGE"
+	// resourceNamePrefix must match namePrefix in config/base/kustomization.yaml.
+	resourceNamePrefix = "dch-"
+
+	ParamRestImage           = "RELATED_IMAGE_ODH_DATA_CONNECT_HUB_REST_IMAGE"
+	ParamFlightImage         = "RELATED_IMAGE_ODH_DATA_CONNECT_HUB_FLIGHT_IMAGE"
+	ParamKubeRbacProxyImage  = "RELATED_IMAGE_ODH_KUBE_RBAC_PROXY_IMAGE"
+	ParamFlightResourceName  = "FLIGHT_RESOURCE_NAME"
+	ParamFlightInstanceName  = "FLIGHT_INSTANCE_NAME"
+	ParamFlightConfigName    = "FLIGHT_CONFIG_NAME"
+	ParamFlightSAName        = "FLIGHT_SA_NAME"
+	ParamFlightCRBName       = "FLIGHT_CRB_NAME"
+	ParamFlightTLSName       = "FLIGHT_TLS_NAME"
+	ParamFlightHTTPRouteName = "FLIGHT_HTTPROUTE_NAME"
 )
 
 // renderKustomization builds the kustomization at diskPath. The whole of
@@ -310,7 +317,7 @@ func buildServicePatches(deploymentName, containerName string, overrides *dchv1a
 	return patches
 }
 
-func flightServiceResourceName(crName string) string {
+func flightInstanceName(crName string) string {
 	return crName + "-flight"
 }
 
@@ -318,75 +325,9 @@ func httpRouteResourceName(crName string) string {
 	return crName + "-route"
 }
 
-func renderFlightService(resources []*unstructured.Unstructured, crName string) []*unstructured.Unstructured {
-	serviceName := flightServiceResourceName(crName)
-	for _, obj := range resources {
-		if isFlightServiceResource(obj) {
-			renameFlightServiceResource(obj, serviceName)
-			continue
-		}
-		if obj.GetKind() == kindHTTPRoute {
-			obj.SetName(httpRouteResourceName(crName))
-			obj.Object = replaceStringValue(obj.UnstructuredContent(), nameFlightService, serviceName).(map[string]any)
-		}
-	}
-	return resources
-}
-
-func isFlightServiceResource(obj *unstructured.Unstructured) bool {
-	name := obj.GetName()
-	switch obj.GetKind() {
-	case kindConfigMap:
-		// The REST service mounts the flight-service-ca ConfigMap, so its
-		// name contains "flight-service" even though it is not a Flight
-		// service resource. Use the app label to distinguish the Flight
-		// ConfigMap from the REST-owned CA ConfigMap.
-		return obj.GetLabels()[labelAppName] == nameFlightService
-	case kindDeployment, kindService, kindServiceAccount, kindNetworkPolicy:
-		return strings.Contains(name, nameFlightService)
-	case kindClusterRoleBinding:
-		return strings.HasSuffix(name, "flight-auth-delegator")
-	default:
-		return false
-	}
-}
-
-func renameFlightServiceResource(obj *unstructured.Unstructured, serviceName string) {
-	content := replaceStringValue(obj.UnstructuredContent(), nameFlightService, serviceName).(map[string]any)
-	obj.Object = content
-	if obj.GetKind() == kindClusterRoleBinding {
-		obj.SetName(strings.Replace(obj.GetName(), "flight-auth-delegator", serviceName+"-auth-delegator", 1))
-	}
-}
-
-func replaceStringValue(value any, old, new string) any {
-	switch value := value.(type) {
-	case string:
-		return strings.ReplaceAll(value, old, new)
-	case map[string]any:
-		for key, child := range value {
-			value[key] = replaceStringValue(child, old, new)
-		}
-	case []any:
-		for i, child := range value {
-			value[i] = replaceStringValue(child, old, new)
-		}
-	}
-	return value
-}
-
-func setConfigMapFlightServiceAddress(resources []*unstructured.Unstructured, namespace, serviceName string) error {
-	var flightSvcName string
-	for _, obj := range resources {
-		if obj.GetKind() == kindService && strings.HasSuffix(obj.GetName(), serviceName) {
-			flightSvcName = obj.GetName()
-			break
-		}
-	}
-	if flightSvcName == "" {
-		return nil
-	}
-	fqdn := fmt.Sprintf("%s.%s.svc", flightSvcName, namespace)
+// setConfigMapFlightServiceAddress updates the REST ConfigMap to point to the flight service FQDN.
+func setConfigMapFlightServiceAddress(resources []*unstructured.Unstructured, namespace, flightResourceName string) error {
+	fqdn := fmt.Sprintf("%s.%s.svc", flightResourceName, namespace)
 	for _, obj := range resources {
 		if obj.GetKind() != kindConfigMap {
 			continue
@@ -410,13 +351,14 @@ func setConfigMapFlightServiceAddress(resources []*unstructured.Unstructured, na
 	return nil
 }
 
-func setConfigMapFlightConnectorSettings(resources []*unstructured.Unstructured, flightName string, overrides *dchv1alpha1.ServiceOverrides) error {
+// setConfigMapFlightConnectorSettings updates the flight ConfigMap with connector overrides.
+func setConfigMapFlightConnectorSettings(resources []*unstructured.Unstructured, flightInstanceName string, overrides *dchv1alpha1.ServiceOverrides) error {
 	if overrides == nil || len(overrides.Connectors) == 0 {
 		return nil
 	}
 
 	for _, obj := range resources {
-		if obj.GetKind() != kindConfigMap || obj.GetLabels()[labelAppName] != flightName {
+		if obj.GetKind() != kindConfigMap || obj.GetLabels()[labelAppName] != flightInstanceName {
 			continue
 		}
 		config, data, err := parseConfigMapTOML(obj)
@@ -652,10 +594,11 @@ func traceEnv(trace *dchv1alpha1.Trace) []corev1.EnvVar {
 	return vars
 }
 
-func setConfigMapDiscoveryServiceAccount(resources []*unstructured.Unstructured, namespace, flightName string) error {
+// setConfigMapDiscoveryServiceAccount updates the flight ConfigMap with the REST service account identity.
+func setConfigMapDiscoveryServiceAccount(resources []*unstructured.Unstructured, namespace, flightInstanceName string) error {
 	var restServiceAccount string
 	for _, obj := range resources {
-		if obj.GetKind() == kindServiceAccount && strings.HasSuffix(obj.GetName(), nameRestService+"-sa") {
+		if obj.GetKind() == kindServiceAccount && obj.GetLabels()[labelAppName] == nameRestService {
 			restServiceAccount = obj.GetName()
 			break
 		}
@@ -666,7 +609,7 @@ func setConfigMapDiscoveryServiceAccount(resources []*unstructured.Unstructured,
 
 	identity := fmt.Sprintf("system:serviceaccount:%s:%s", namespace, restServiceAccount)
 	for _, obj := range resources {
-		if obj.GetKind() != kindConfigMap || !strings.Contains(obj.GetName(), flightName) {
+		if obj.GetKind() != kindConfigMap || obj.GetLabels()[labelAppName] != flightInstanceName {
 			continue
 		}
 		config, data, err := parseConfigMapTOML(obj)
