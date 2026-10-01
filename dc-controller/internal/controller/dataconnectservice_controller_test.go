@@ -52,7 +52,7 @@ var _ = Describe("DataConnectService Controller", func() {
 		// Kustomize adds this prefix to all resource names.
 		np                  = "dch-"
 		flightResourceName  = np + resourceName + "-flight"
-		flightContainerName = resourceName + "-flight"
+		flightContainerName = nameFlightService
 	)
 
 	ctx := context.Background()

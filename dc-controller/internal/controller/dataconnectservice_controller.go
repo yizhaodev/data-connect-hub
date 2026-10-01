@@ -420,7 +420,7 @@ func (r *DataConnectServiceReconciler) reconcileManifests(
 		}
 	}
 
-	if !reconcileTraceEnv(resources, cr.Spec.Trace, nameRestService, flightContainerName) {
+	if !reconcileTraceEnv(resources, cr.Spec.Trace, nameRestService, nameFlightService) {
 		logf.FromContext(ctx).V(1).Info("trace reconciliation: no service container found in rendered manifests")
 	}
 

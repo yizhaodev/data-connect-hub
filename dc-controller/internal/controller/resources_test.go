@@ -483,3 +483,182 @@ func TestAnnotateFlightDeploymentsWithConfigHash(t *testing.T) {
 		t.Fatal("expected dataconnecthub/config-hash annotation on Flight Deployment")
 	}
 }
+
+func TestRenderFlightServiceNaming(t *testing.T) {
+	manifestsPath := filepath.Join("..", "..", "..", "config")
+	crName := "test-dcs"
+	flightName := flightServiceResourceName(crName)
+	resourceName := "dch-" + flightName
+
+	paths := []struct {
+		name string
+		path string
+	}{
+		{name: "base", path: filepath.Join(manifestsPath, "base")},
+		{name: "openshift overlay", path: filepath.Join(manifestsPath, "overlays", "openshift")},
+	}
+
+	for _, tt := range paths {
+		t.Run(tt.name, func(t *testing.T) {
+			resources, err := renderKustomization(manifestsPath, tt.path, nil, nil, nil)
+			if err != nil {
+				t.Fatalf("rendering %s: %v", tt.path, err)
+			}
+			resources = renderFlightService(resources, crName)
+
+			// Resource names
+			requireResource(t, resources, kindDeployment, resourceName)
+			requireResource(t, resources, kindService, resourceName)
+			requireResource(t, resources, kindNetworkPolicy, resourceName)
+			requireResource(t, resources, kindConfigMap, resourceName+"-config")
+			requireResource(t, resources, kindServiceAccount, resourceName+"-sa")
+			requireResource(t, resources, kindClusterRoleBinding, resourceName+"-auth-delegator")
+			requireResource(t, resources, kindHTTPRoute, httpRouteResourceName(crName))
+
+			// REST resources must NOT be renamed
+			requireResource(t, resources, kindDeployment, "dch-rest-service")
+			requireResource(t, resources, kindConfigMap, "dch-flight-service-ca")
+
+			// Labels
+			deploy := findResource(resources, kindDeployment, resourceName)
+			assertFieldEquals(t, deploy, flightName, "metadata", "labels", labelAppName)
+			assertFieldEquals(t, deploy, flightName, "spec", "selector", "matchLabels", labelAppName)
+			assertFieldEquals(t, deploy, flightName, "spec", "template", "metadata", "labels", labelAppName)
+
+			svc := findResource(resources, kindService, resourceName)
+			assertFieldEquals(t, svc, flightName, "metadata", "labels", labelAppName)
+			assertFieldEquals(t, svc, flightName, "spec", "selector", labelAppName)
+
+			np := findResource(resources, kindNetworkPolicy, resourceName)
+			assertFieldEquals(t, np, flightName, "spec", "podSelector", "matchLabels", labelAppName)
+
+			cm := findResource(resources, kindConfigMap, resourceName+"-config")
+			assertFieldEquals(t, cm, flightName, "metadata", "labels", labelAppName)
+
+			// Container name stays as the original (not renamed)
+			containers, _, _ := unstructured.NestedSlice(deploy.Object,
+				"spec", "template", "spec", "containers")
+			foundContainer := false
+			for _, c := range containers {
+				if container, ok := c.(map[string]any); ok {
+					if name, _ := container["name"].(string); name == nameFlightService {
+						foundContainer = true
+						break
+					}
+				}
+			}
+			if !foundContainer {
+				t.Errorf("container %q not found in Deployment %s", nameFlightService, resourceName)
+			}
+
+			// Cross-references
+			assertFieldEquals(t, deploy, resourceName+"-sa",
+				"spec", "template", "spec", "serviceAccountName")
+
+			volumes, _, _ := unstructured.NestedSlice(deploy.Object,
+				"spec", "template", "spec", "volumes")
+			assertVolumeRef(t, volumes, "config", "configMap", "name", resourceName+"-config")
+			assertVolumeRef(t, volumes, "tls", "secret", "secretName", flightName+"-tls")
+
+			// Service annotation
+			ann := svc.GetAnnotations()
+			tlsName := ann["service.beta.openshift.io/serving-cert-secret-name"]
+			if tlsName != flightName+"-tls" {
+				t.Errorf("serving-cert-secret-name = %q, want %q", tlsName, flightName+"-tls")
+			}
+
+			// ClusterRoleBinding subjects
+			crb := findResource(resources, kindClusterRoleBinding, resourceName+"-auth-delegator")
+			subjects, _, _ := unstructured.NestedSlice(crb.Object, "subjects")
+			if len(subjects) == 0 {
+				t.Fatal("CRB has no subjects")
+			}
+			sub := subjects[0].(map[string]any)
+			if sub["name"] != resourceName+"-sa" {
+				t.Errorf("CRB subject name = %q, want %q", sub["name"], resourceName+"-sa")
+			}
+
+			// HTTPRoute backendRef for flight
+			hr := findResource(resources, kindHTTPRoute, httpRouteResourceName(crName))
+			rules, _, _ := unstructured.NestedSlice(hr.Object, "spec", "rules")
+			foundBackendRef := false
+			for _, rule := range rules {
+				r := rule.(map[string]any)
+				refs, _ := r["backendRefs"].([]any)
+				for _, ref := range refs {
+					br := ref.(map[string]any)
+					if name, _ := br["name"].(string); name == resourceName {
+						foundBackendRef = true
+					}
+				}
+			}
+			if !foundBackendRef {
+				t.Errorf("HTTPRoute backendRef %q not found", resourceName)
+			}
+
+			// ConfigMap data must NOT be modified by the rename
+			tomlData, _, _ := unstructured.NestedString(cm.Object, "data", "config.toml")
+			if tomlData == "" {
+				t.Fatal("flight ConfigMap config.toml is empty")
+			}
+			if strings.Contains(tomlData, flightName) {
+				t.Error("flight ConfigMap config.toml was modified by rename — TOML content should be untouched")
+			}
+		})
+	}
+}
+
+func findResource(resources []*unstructured.Unstructured, kind, name string) *unstructured.Unstructured {
+	for _, obj := range resources {
+		if obj.GetKind() == kind && obj.GetName() == name {
+			return obj
+		}
+	}
+	return nil
+}
+
+func requireResource(t *testing.T, resources []*unstructured.Unstructured, kind, name string) {
+	t.Helper()
+	if findResource(resources, kind, name) == nil {
+		t.Errorf("expected %s %q not found in rendered resources", kind, name)
+	}
+}
+
+func assertFieldEquals(t *testing.T, obj *unstructured.Unstructured, want string, fields ...string) {
+	t.Helper()
+	if obj == nil {
+		t.Errorf("nil object when checking field %v", fields)
+		return
+	}
+	val, found, _ := unstructured.NestedString(obj.Object, fields...)
+	if !found {
+		t.Errorf("field %v not found in %s %s", fields, obj.GetKind(), obj.GetName())
+		return
+	}
+	if val != want {
+		t.Errorf("field %v in %s %s = %q, want %q", fields, obj.GetKind(), obj.GetName(), val, want)
+	}
+}
+
+func assertVolumeRef(t *testing.T, volumes []any, volumeName, sourceType, sourceKey, want string) {
+	t.Helper()
+	for _, v := range volumes {
+		vol, ok := v.(map[string]any)
+		if !ok {
+			continue
+		}
+		if n, _ := vol["name"].(string); n != volumeName {
+			continue
+		}
+		src, ok := vol[sourceType].(map[string]any)
+		if !ok {
+			t.Errorf("volume %q has no %s source", volumeName, sourceType)
+			return
+		}
+		if got, _ := src[sourceKey].(string); got != want {
+			t.Errorf("volume %q %s.%s = %q, want %q", volumeName, sourceType, sourceKey, got, want)
+		}
+		return
+	}
+	t.Errorf("volume %q not found", volumeName)
+}
