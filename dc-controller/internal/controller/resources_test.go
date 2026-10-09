@@ -50,6 +50,8 @@ const (
 	testFlightImageParam             = "FLIGHT_IMAGE"
 	testSpecKey                      = "spec"
 	testNamespace                    = "test-ns"
+	testDynamicNamespace             = "test-namespace"
+	testFlightInstanceName           = "default-dcs-flight"
 	testFlightServiceCA              = "flight-service-ca"
 )
 
@@ -90,7 +92,7 @@ func parsedConfigMapTOML(t *testing.T, configMap *unstructured.Unstructured) map
 	return config
 }
 
-func TestSetConfigMapFlightConnectorSettingsAddConnector(t *testing.T) {
+func TestInjectDynamicConfigConnectorSettingsAddConnector(t *testing.T) {
 	// Add connector settings for connectors that are not in the base configuration.
 	disabled := false
 	enabled := true
@@ -136,7 +138,8 @@ enabled = true
 		t.Run(tt.name, func(t *testing.T) {
 			configMap := flightServiceConfigMap(tt.configTOML)
 
-			if err := setConfigMapFlightConnectorSettings([]*unstructured.Unstructured{configMap}, nameFlightService, &dchv1alpha1.ServiceOverrides{
+			if _, err := injectDynamicConfig([]*unstructured.Unstructured{configMap}, dynamicInputs{
+				FlightName: nameFlightService,
 				Connectors: []dchv1alpha1.ConnectorConfig{{Name: tt.connectorName, Enabled: tt.enabled}},
 			}); err != nil {
 				t.Fatal(err)
@@ -153,7 +156,7 @@ enabled = true
 	}
 }
 
-func TestSetConfigMapFlightConnectorSettingsUpdateConnector(t *testing.T) {
+func TestInjectDynamicConfigConnectorSettingsUpdateConnector(t *testing.T) {
 	// Update specified connector settings while preserving unspecified connector settings.
 	enabled := true
 	connectionTimeout := &metav1.Duration{Duration: 30 * time.Second}
@@ -182,7 +185,8 @@ connection_timeout_secs = 20
 `
 	configMap := flightServiceConfigMap(configTOML)
 
-	if err := setConfigMapFlightConnectorSettings([]*unstructured.Unstructured{configMap}, nameFlightService, &dchv1alpha1.ServiceOverrides{
+	if _, err := injectDynamicConfig([]*unstructured.Unstructured{configMap}, dynamicInputs{
+		FlightName: nameFlightService,
 		Connectors: []dchv1alpha1.ConnectorConfig{
 			{
 				Name:              testSQLiteConnector,
@@ -244,7 +248,7 @@ connection_timeout_secs = 20
 	}
 }
 
-func TestSetConfigMapFlightServiceAddress(t *testing.T) {
+func TestInjectDynamicConfigFlightServiceAddress(t *testing.T) {
 	configMap := configMapWithTOML(`[flight-service]
 address = "flight-service"
 `)
@@ -255,7 +259,10 @@ address = "flight-service"
 		},
 	}}
 
-	if err := setConfigMapFlightServiceAddress([]*unstructured.Unstructured{service, configMap}, "test-namespace", "default-dcs-flight"); err != nil {
+	if _, err := injectDynamicConfig([]*unstructured.Unstructured{service, configMap}, dynamicInputs{
+		Namespace:  testDynamicNamespace,
+		FlightName: testFlightInstanceName,
+	}); err != nil {
 		t.Fatal(err)
 	}
 	flightService, ok := parsedConfigMapTOML(t, configMap)["flight-service"].(map[string]any)
@@ -267,7 +274,7 @@ address = "flight-service"
 	}
 }
 
-func TestSetConfigMapGlobalNamespace(t *testing.T) {
+func TestInjectDynamicConfigGlobalNamespace(t *testing.T) {
 	defaultTenant := configMapWithTOML(`[global-connection-types]
 tenant-id = "opendatahub"
 `)
@@ -278,7 +285,9 @@ tenant-id = "custom-tenant"
 port = 8080
 `)
 
-	if err := setConfigMapGlobalNamespace([]*unstructured.Unstructured{defaultTenant, customTenant, noTenant}, "test-namespace"); err != nil {
+	if _, err := injectDynamicConfig([]*unstructured.Unstructured{defaultTenant, customTenant, noTenant}, dynamicInputs{
+		Namespace: testDynamicNamespace,
+	}); err != nil {
 		t.Fatal(err)
 	}
 
@@ -287,7 +296,7 @@ port = 8080
 		cm   *unstructured.Unstructured
 		want string
 	}{
-		{name: "default tenant", cm: defaultTenant, want: "test-namespace"},
+		{name: "default tenant", cm: defaultTenant, want: testDynamicNamespace},
 		{name: "custom tenant remains unchanged", cm: customTenant, want: "custom-tenant"},
 	} {
 		t.Run(tt.name, func(t *testing.T) {
@@ -305,7 +314,7 @@ port = 8080
 	}
 }
 
-func TestSetConfigMapDiscoveryServiceAccount(t *testing.T) {
+func TestInjectDynamicConfigDiscoveryServiceAccount(t *testing.T) {
 	configMap := configMapWithTOML(`[auth]
 enabled = true
 discovery_service_account = "old-identity"
@@ -318,7 +327,10 @@ discovery_service_account = "old-identity"
 		},
 	}}
 
-	if err := setConfigMapDiscoveryServiceAccount([]*unstructured.Unstructured{serviceAccount, configMap}, "test-namespace", "default-dcs-flight"); err != nil {
+	if _, err := injectDynamicConfig([]*unstructured.Unstructured{serviceAccount, configMap}, dynamicInputs{
+		Namespace:  testDynamicNamespace,
+		FlightName: testFlightInstanceName,
+	}); err != nil {
 		t.Fatal(err)
 	}
 	auth, ok := parsedConfigMapTOML(t, configMap)["auth"].(map[string]any)
@@ -330,7 +342,7 @@ discovery_service_account = "old-identity"
 	}
 }
 
-func TestSetConfigMapAudiences(t *testing.T) {
+func TestInjectDynamicConfigAudiences(t *testing.T) {
 	configMap := configMapWithTOML(`[auth]
 enabled = true
 token_review_audiences = ["old-audience"]
@@ -340,11 +352,13 @@ port = 8080
 `)
 	audiences := []string{"audience-one", "audience-two"}
 
-	updated, err := setConfigMapAudiences([]*unstructured.Unstructured{configMap, noAuth}, audiences)
+	authUpdated, err := injectDynamicConfig([]*unstructured.Unstructured{configMap, noAuth}, dynamicInputs{
+		Audiences: audiences,
+	})
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !updated {
+	if !authUpdated {
 		t.Fatal("expected an auth ConfigMap to be updated")
 	}
 	auth, ok := parsedConfigMapTOML(t, configMap)["auth"].(map[string]any)
@@ -365,9 +379,9 @@ port = 8080
 	}
 }
 
-func TestSetConfigMapAudiencesRejectsInvalidTOML(t *testing.T) {
+func TestInjectDynamicConfigRejectsInvalidTOML(t *testing.T) {
 	configMap := configMapWithTOML("[auth\nenabled = true")
-	if _, err := setConfigMapAudiences([]*unstructured.Unstructured{configMap}, []string{"audience"}); err == nil {
+	if _, err := injectDynamicConfig([]*unstructured.Unstructured{configMap}, dynamicInputs{Audiences: []string{"audience"}}); err == nil {
 		t.Fatal("expected invalid TOML to return an error")
 	}
 }
@@ -644,7 +658,7 @@ func TestAnnotateDeploymentsWithContentHash(t *testing.T) {
 	deployment := &unstructured.Unstructured{Object: map[string]any{
 		testKindKey: kindDeployment,
 		testMetadataKey: map[string]any{
-			testNameKey: "default-dcs-flight",
+			testNameKey: testFlightInstanceName,
 		},
 		testSpecKey: map[string]any{
 			"template": map[string]any{
