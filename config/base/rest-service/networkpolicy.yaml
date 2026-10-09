@@ -11,11 +11,32 @@ spec:
       app.kubernetes.io/name: rest-service
   policyTypes:
     - Ingress
-    - Egress
-  # Allow-all for now: we don't yet have a defined gateway/client topology to
-  # scope this down to. This exists so the policy can be tightened later
-  # without having to introduce the resource from scratch.
   ingress:
-    - {}
-  egress:
-    - {}
+    # Gateway proxy → REST (port 8443).
+    # The namespace value is a placeholder; the controller patches it to the
+    # resolved gateway namespace at render time.
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: opendatahub
+      ports:
+        - protocol: TCP
+          port: 8443
+    # dc-controller → REST (same namespace, flight registration).
+    # The controller and operand share a namespace by design (the CRD is
+    # namespaced and the controller has no operandNamespace indirection),
+    # so a bare podSelector without namespaceSelector is correct here.
+    - from:
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/name: dc-controller
+      ports:
+        - protocol: TCP
+          port: 8443
+    # Metrics scraping.
+    # TODO: restrict source to the monitoring namespace once the set of
+    # Prometheus deployment topologies (OpenShift, standalone, ODH) is
+    # settled.
+    - ports:
+        - protocol: TCP
+          port: 9090

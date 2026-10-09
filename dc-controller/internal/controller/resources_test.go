@@ -28,6 +28,7 @@ import (
 	dchv1alpha1 "github.com/opendatahub-io/data-connect-hub/dc-controller/api/dataconnecthub/v1alpha1"
 	"github.com/pelletier/go-toml/v2"
 	corev1 "k8s.io/api/core/v1"
+	networkingv1 "k8s.io/api/networking/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime"
@@ -764,4 +765,131 @@ func TestAnnotateDeploymentsWithContentHash_FallsBackToLiveConfigMap(t *testing.
 	if !found || annotations[annotationConfigHash] == "" {
 		t.Fatal("expected hash annotation from live-fetched CA ConfigMap")
 	}
+}
+
+func TestPatchNetworkPolicyGatewayNamespace(t *testing.T) {
+	makeNP := func(name, ns string) *unstructured.Unstructured {
+		return &unstructured.Unstructured{Object: map[string]any{
+			"apiVersion": "networking.k8s.io/v1",
+			"kind":       "NetworkPolicy",
+			"metadata":   map[string]any{"name": name},
+			"spec": map[string]any{
+				"ingress": []any{
+					map[string]any{
+						"from": []any{
+							map[string]any{
+								"namespaceSelector": map[string]any{
+									"matchLabels": map[string]any{
+										"kubernetes.io/metadata.name": ns,
+									},
+								},
+							},
+						},
+						"ports": []any{
+							map[string]any{"protocol": "TCP", "port": int64(8443)},
+						},
+					},
+				},
+			},
+		}}
+	}
+
+	allNS := func(t *testing.T, obj *unstructured.Unstructured) []string {
+		t.Helper()
+		var np networkingv1.NetworkPolicy
+		if err := runtime.DefaultUnstructuredConverter.FromUnstructured(obj.Object, &np); err != nil {
+			t.Fatalf("converting unstructured to NetworkPolicy: %v", err)
+		}
+		var namespaces []string
+		for _, rule := range np.Spec.Ingress {
+			for _, peer := range rule.From {
+				if peer.NamespaceSelector != nil {
+					if v, ok := peer.NamespaceSelector.MatchLabels[labelNamespaceName]; ok {
+						namespaces = append(namespaces, v)
+					}
+				}
+			}
+		}
+		return namespaces
+	}
+
+	firstNS := func(t *testing.T, obj *unstructured.Unstructured) string {
+		t.Helper()
+		ns := allNS(t, obj)
+		if len(ns) == 0 {
+			t.Fatal("no namespaceSelector with namespace label found")
+		}
+		return ns[0]
+	}
+
+	t.Run("patches when gateway namespace differs from default", func(t *testing.T) {
+		np := makeNP("rest-service", defaultGatewayNamespace)
+		if err := patchNetworkPolicyGatewayNamespace([]*unstructured.Unstructured{np}, "dch"); err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if got := firstNS(t, np); got != "dch" {
+			t.Fatalf("expected namespace 'dch', got %q", got)
+		}
+	})
+
+	t.Run("no-op when gateway namespace is default", func(t *testing.T) {
+		np := makeNP("rest-service", defaultGatewayNamespace)
+		if err := patchNetworkPolicyGatewayNamespace([]*unstructured.Unstructured{np}, defaultGatewayNamespace); err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if got := firstNS(t, np); got != defaultGatewayNamespace {
+			t.Fatalf("expected namespace %q, got %q", defaultGatewayNamespace, got)
+		}
+	})
+
+	t.Run("skips non-NetworkPolicy resources", func(t *testing.T) {
+		deployment := &unstructured.Unstructured{Object: map[string]any{
+			"apiVersion": "apps/v1",
+			"kind":       "Deployment",
+			"metadata":   map[string]any{"name": "rest-service"},
+		}}
+		np := makeNP("flight-service", defaultGatewayNamespace)
+		if err := patchNetworkPolicyGatewayNamespace([]*unstructured.Unstructured{deployment, np}, "custom-ns"); err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if got := firstNS(t, np); got != "custom-ns" {
+			t.Fatalf("expected namespace 'custom-ns', got %q", got)
+		}
+	})
+
+	t.Run("only rewrites the placeholder value", func(t *testing.T) {
+		np := makeNP("rest-service", defaultGatewayNamespace)
+		// Append a second ingress rule with a different namespace.
+		spec := np.Object["spec"].(map[string]any)
+		ingress := spec["ingress"].([]any)
+		ingress = append(ingress, map[string]any{
+			"from": []any{
+				map[string]any{
+					"namespaceSelector": map[string]any{
+						"matchLabels": map[string]any{
+							"kubernetes.io/metadata.name": "monitoring-ns",
+						},
+					},
+				},
+			},
+			"ports": []any{
+				map[string]any{"protocol": "TCP", "port": int64(9090)},
+			},
+		})
+		spec["ingress"] = ingress
+
+		if err := patchNetworkPolicyGatewayNamespace([]*unstructured.Unstructured{np}, "dch"); err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		namespaces := allNS(t, np)
+		if len(namespaces) != 2 {
+			t.Fatalf("expected 2 namespaceSelectors, got %d", len(namespaces))
+		}
+		if namespaces[0] != "dch" {
+			t.Fatalf("expected first namespace 'dch', got %q", namespaces[0])
+		}
+		if namespaces[1] != "monitoring-ns" {
+			t.Fatalf("expected second namespace 'monitoring-ns' (unchanged), got %q", namespaces[1])
+		}
+	})
 }

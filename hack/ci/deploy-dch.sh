@@ -147,8 +147,6 @@ controller_tag="${CI_CONTROLLER_IMAGE##*:}"
 
 helm upgrade --install dc-controller "$CI_REPO_ROOT/dc-controller/charts" \
     --namespace "$CI_CONTROLLER_NAMESPACE" \
-    --set operandNamespace="$CI_SVC_NAMESPACE" \
-    --set dataConnectService.enabled=false \
     --set controllerManager.image.pullPolicy=IfNotPresent \
     --set "controllerManager.image.repository=${controller_repo}" \
     --set "controllerManager.image.tag=${controller_tag}" \

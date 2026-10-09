@@ -106,6 +106,7 @@ const (
 	labelManagedBy       = "dataconnecthub.opendatahub.io/managed-by"
 	managedByDCHService  = "dataconnectservice"
 	labelAppName         = "app.kubernetes.io/name"
+	labelNamespaceName   = "kubernetes.io/metadata.name"
 	annotationSpecHash   = "dataconnecthub/spec-hash"
 	annotationConfigHash = "dataconnecthub/config-hash"
 
@@ -413,6 +414,9 @@ func (r *DataConnectServiceReconciler) reconcileManifests(
 
 	resources = renderFlightService(resources, cr.Name)
 	flightInstanceName := flightServiceResourceName(cr.Name)
+	if err := patchNetworkPolicyGatewayNamespace(resources, gw.Namespace); err != nil {
+		return fmt.Errorf("patching network policy gateway namespace: %w", err)
+	}
 
 	if err := setConfigMapGlobalNamespace(resources, cr.Namespace); err != nil {
 		return fmt.Errorf("setting config namespace: %w", err)

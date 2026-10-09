@@ -31,8 +31,10 @@ import (
 	"time"
 
 	corev1 "k8s.io/api/core/v1"
+	networkingv1 "k8s.io/api/networking/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
+	"k8s.io/apimachinery/pkg/runtime"
 	apimachtypes "k8s.io/apimachinery/pkg/types"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
@@ -707,6 +709,53 @@ spec:
 			Patch: patchYAML,
 		},
 	}
+}
+
+// patchNetworkPolicyGatewayNamespace replaces the default gateway namespace
+// placeholder in NetworkPolicy ingress rules with the actual gateway namespace.
+// The base manifests use "opendatahub" as a placeholder; the resolved gateway
+// namespace comes from the CR spec or platform ConfigMap.
+//
+// NOTE: this matches by value (== defaultGatewayNamespace), so it will rewrite
+// every namespaceSelector whose value is "opendatahub". Currently only the
+// gateway ingress rules use that value. If a future rule also targets the
+// opendatahub namespace for a different purpose (e.g. metrics), switch to a
+// more targeted match (dedicated annotation or label key).
+func patchNetworkPolicyGatewayNamespace(resources []*unstructured.Unstructured, gatewayNamespace string) error {
+	if gatewayNamespace == defaultGatewayNamespace {
+		return nil
+	}
+	for _, obj := range resources {
+		if obj.GetKind() != kindNetworkPolicy {
+			continue
+		}
+		var np networkingv1.NetworkPolicy
+		if err := runtime.DefaultUnstructuredConverter.FromUnstructured(obj.Object, &np); err != nil {
+			return fmt.Errorf("converting NetworkPolicy %q from unstructured: %w", obj.GetName(), err)
+		}
+		patched := false
+		for i := range np.Spec.Ingress {
+			for j := range np.Spec.Ingress[i].From {
+				peer := &np.Spec.Ingress[i].From[j]
+				if peer.NamespaceSelector == nil {
+					continue
+				}
+				if peer.NamespaceSelector.MatchLabels[labelNamespaceName] == defaultGatewayNamespace {
+					peer.NamespaceSelector.MatchLabels[labelNamespaceName] = gatewayNamespace
+					patched = true
+				}
+			}
+		}
+		if !patched {
+			continue
+		}
+		out, err := runtime.DefaultUnstructuredConverter.ToUnstructured(&np)
+		if err != nil {
+			return fmt.Errorf("converting NetworkPolicy %q to unstructured: %w", np.Name, err)
+		}
+		obj.Object = out
+	}
+	return nil
 }
 
 // --- Apply resources with SSA and owner references ---
