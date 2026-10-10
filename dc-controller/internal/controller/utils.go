@@ -43,6 +43,17 @@ func parseConfigMapTOML(obj *unstructured.Unstructured) (config map[string]any, 
 	return config, data, nil
 }
 
+// ensureTOMLSection returns the named table of a parsed config.toml,
+// creating it when the section does not exist yet.
+func ensureTOMLSection(config map[string]any, key string) map[string]any {
+	section, ok := config[key].(map[string]any)
+	if !ok {
+		section = make(map[string]any)
+		config[key] = section
+	}
+	return section
+}
+
 // setConfigMapTOML serializes config and writes it back to the ConfigMap data.
 func setConfigMapTOML(obj *unstructured.Unstructured, config map[string]any, data map[string]string) error {
 	out, err := toml.Marshal(config)
