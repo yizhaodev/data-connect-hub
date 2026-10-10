@@ -30,13 +30,17 @@ import (
 	"strings"
 	"time"
 
+	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
+	networkingv1 "k8s.io/api/networking/v1"
+	rbacv1 "k8s.io/api/rbac/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	apimachtypes "k8s.io/apimachinery/pkg/types"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
 	logf "sigs.k8s.io/controller-runtime/pkg/log"
+	gatewayv1 "sigs.k8s.io/gateway-api/apis/v1"
 	"sigs.k8s.io/kustomize/api/krusty"
 	kustypes "sigs.k8s.io/kustomize/api/types"
 	"sigs.k8s.io/kustomize/kyaml/filesys"
@@ -85,7 +89,13 @@ func renderKustomization(rootPath, diskPath string, patches []kustypes.Patch, im
 	}
 
 	if len(patches) > 0 || len(images) > 0 {
-		if err := patchKustomization(memFS, absPath, patches, images); err != nil {
+		// Patches are injected into the base kustomization rather than the
+		// render root so they are applied before base's namePrefix: targets
+		// match base resource names directly, and resources renamed by a
+		// patch keep the prefix under any overlay root. base is also where
+		// params.env is merged above, so the layout assumption is shared.
+		patchDir := filepath.Join(absRoot, "base")
+		if err := patchKustomization(memFS, patchDir, patches, images); err != nil {
 			return nil, fmt.Errorf("patching kustomization: %w", err)
 		}
 	}
@@ -299,7 +309,7 @@ func buildServicePatches(deploymentName, containerName string, overrides *dchv1a
 		patches = append(patches, kustypes.Patch{
 			Target: &kustypes.Selector{
 				ResId: resid.ResId{
-					Gvk:  resid.Gvk{Group: "apps", Version: "v1", Kind: kindDeployment},
+					Gvk:  resid.Gvk{Group: appsv1.GroupName, Version: "v1", Kind: kindDeployment},
 					Name: deploymentName,
 				},
 			},
@@ -318,61 +328,132 @@ func httpRouteResourceName(crName string) string {
 	return crName + "-route"
 }
 
-func renderFlightService(resources []*unstructured.Unstructured, crName string) []*unstructured.Unstructured {
-	serviceName := flightServiceResourceName(crName)
-	for _, obj := range resources {
-		if isFlightServiceResource(obj) {
-			renameFlightServiceResource(obj, serviceName)
-			continue
-		}
-		if obj.GetKind() == kindHTTPRoute {
-			obj.SetName(httpRouteResourceName(crName))
-			obj.Object = replaceStringValue(obj.UnstructuredContent(), nameFlightService, serviceName).(map[string]any)
-		}
-	}
-	return resources
-}
+// buildFlightRenamePatches returns the strategic merge patches that give
+// every flight-service resource its per-CR instance identity: resource names
+// become <cr>-flight* (final name = kustomize namePrefix + new name), the
+// app.kubernetes.io/name label and all selectors are instance-scoped so that
+// multiple flight instances in one namespace cannot select each other's
+// pods, and the serving-cert secret is renamed to <cr>-flight-tls in both the
+// Service annotation and the Deployment volume.
+//
+// Cross-resource references (Deployment serviceAccountName, mounted ConfigMap
+// and secret names, ClusterRoleBinding subjects, HTTPRoute backendRefs) are
+// rewritten automatically by Kustomize nameReference — the patches only set
+// names, labels and selectors explicitly. Targets are matched by base
+// (pre-namePrefix) resource names, so the patches work under any overlay root.
+//
+// Patch contents are assembled as maps and marshalled to YAML rather than
+// written as literal YAML strings, so label nesting depth cannot corrupt the
+// patch the way hand-computed indentation can.
+func buildFlightRenamePatches(crName string) ([]kustypes.Patch, error) {
+	name := flightServiceResourceName(crName)
+	tlsSecret := name + "-tls"
+	instanceLabels := map[string]any{labelAppName: name}
+	labelSelector := map[string]any{"matchLabels": instanceLabels}
 
-func isFlightServiceResource(obj *unstructured.Unstructured) bool {
-	name := obj.GetName()
-	switch obj.GetKind() {
-	case kindConfigMap:
-		// The REST service mounts the flight-service-ca ConfigMap, so its
-		// name contains "flight-service" even though it is not a Flight
-		// service resource. Use the app label to distinguish the Flight
-		// ConfigMap from the REST-owned CA ConfigMap.
-		return obj.GetLabels()[labelAppName] == nameFlightService
-	case kindDeployment, kindService, kindServiceAccount, kindNetworkPolicy:
-		return strings.Contains(name, nameFlightService)
-	case kindClusterRoleBinding:
-		return strings.HasSuffix(name, "flight-auth-delegator")
-	default:
-		return false
+	renames := []struct {
+		gvk      resid.Gvk
+		baseName string
+		patch    map[string]any
+	}{
+		{
+			// Service: instance name, label, selector and serving-cert secret.
+			gvk:      resid.Gvk{Version: "v1", Kind: kindService},
+			baseName: nameFlightService,
+			patch: map[string]any{
+				"metadata": map[string]any{
+					"name":   name,
+					"labels": instanceLabels,
+					"annotations": map[string]any{
+						"service.beta.openshift.io/serving-cert-secret-name": tlsSecret,
+					},
+				},
+				"spec": map[string]any{"selector": instanceLabels},
+			},
+		},
+		{
+			// Deployment: instance name, labels at all three levels, TLS secret
+			// volume. serviceAccountName and the configMap volume are rewritten
+			// by nameReference.
+			gvk:      resid.Gvk{Group: appsv1.GroupName, Version: "v1", Kind: kindDeployment},
+			baseName: nameFlightService,
+			patch: map[string]any{
+				"metadata": map[string]any{"name": name, "labels": instanceLabels},
+				"spec": map[string]any{
+					"selector": labelSelector,
+					"template": map[string]any{
+						"metadata": map[string]any{"labels": instanceLabels},
+						"spec": map[string]any{
+							"volumes": []any{map[string]any{
+								"name":   "tls",
+								"secret": map[string]any{"secretName": tlsSecret},
+							}},
+						},
+					},
+				},
+			},
+		},
+		{
+			// NetworkPolicy: instance name, label and podSelector.
+			gvk:      resid.Gvk{Group: networkingv1.GroupName, Version: "v1", Kind: kindNetworkPolicy},
+			baseName: nameFlightService,
+			patch: map[string]any{
+				"metadata": map[string]any{"name": name, "labels": instanceLabels},
+				"spec":     map[string]any{"podSelector": labelSelector},
+			},
+		},
+		{
+			// ServiceAccount: instance name and label.
+			gvk:      resid.Gvk{Version: "v1", Kind: kindServiceAccount},
+			baseName: nameFlightService + "-sa",
+			patch: map[string]any{
+				"metadata": map[string]any{"name": name + "-sa", "labels": instanceLabels},
+			},
+		},
+		{
+			// ConfigMap: instance name and label. data is never touched.
+			gvk:      resid.Gvk{Version: "v1", Kind: kindConfigMap},
+			baseName: nameFlightService + "-config",
+			patch: map[string]any{
+				"metadata": map[string]any{"name": name + "-config", "labels": instanceLabels},
+			},
+		},
+		{
+			// ClusterRoleBinding: instance name and label; subjects are
+			// rewritten by nameReference.
+			gvk:      resid.Gvk{Group: rbacv1.GroupName, Version: "v1", Kind: kindClusterRoleBinding},
+			baseName: "flight-auth-delegator",
+			patch: map[string]any{
+				"metadata": map[string]any{"name": name + "-auth-delegator", "labels": instanceLabels},
+			},
+		},
+		{
+			// HTTPRoute: instance name; backendRefs are rewritten by the
+			// name-reference.yaml Service rule.
+			gvk:      resid.Gvk{Group: gatewayv1.GroupName, Version: "v1", Kind: kindHTTPRoute},
+			baseName: "data-connect-hub",
+			patch:    map[string]any{"metadata": map[string]any{"name": httpRouteResourceName(crName)}},
+		},
 	}
-}
 
-func renameFlightServiceResource(obj *unstructured.Unstructured, serviceName string) {
-	content := replaceStringValue(obj.UnstructuredContent(), nameFlightService, serviceName).(map[string]any)
-	obj.Object = content
-	if obj.GetKind() == kindClusterRoleBinding {
-		obj.SetName(strings.Replace(obj.GetName(), "flight-auth-delegator", serviceName+"-auth-delegator", 1))
-	}
-}
-
-func replaceStringValue(value any, old, new string) any {
-	switch value := value.(type) {
-	case string:
-		return strings.ReplaceAll(value, old, new)
-	case map[string]any:
-		for key, child := range value {
-			value[key] = replaceStringValue(child, old, new)
+	patches := make([]kustypes.Patch, 0, len(renames))
+	for _, r := range renames {
+		content := r.patch
+		content["apiVersion"] = r.gvk.ApiVersion()
+		content["kind"] = r.gvk.Kind
+		patch, err := sigyaml.Marshal(content)
+		if err != nil {
+			return nil, fmt.Errorf("marshalling %s %s rename patch: %w", r.gvk.Kind, r.baseName, err)
 		}
-	case []any:
-		for i, child := range value {
-			value[i] = replaceStringValue(child, old, new)
-		}
+		patches = append(patches, kustypes.Patch{
+			Target: &kustypes.Selector{
+				ResId: resid.ResId{Gvk: r.gvk, Name: r.baseName},
+			},
+			Options: &kustypes.PatchArgs{AllowNameChange: true},
+			Patch:   string(patch),
+		})
 	}
-	return value
+	return patches, nil
 }
 
 func setConfigMapFlightServiceAddress(resources []*unstructured.Unstructured, namespace, serviceName string) error {
@@ -693,14 +774,14 @@ func buildGatewayPatches(gw *dchv1alpha1.Gateway) []kustypes.Patch {
 		return nil
 	}
 
-	patchYAML := fmt.Sprintf(`apiVersion: gateway.networking.k8s.io/v1
+	patchYAML := fmt.Sprintf(`apiVersion: %s/v1
 kind: HTTPRoute
 metadata:
   name: data-connect-hub
 spec:
   parentRefs:
     - name: %s
-      namespace: %s`, gw.Name, gw.Namespace)
+      namespace: %s`, gatewayv1.GroupName, gw.Name, gw.Namespace)
 
 	return []kustypes.Patch{
 		{

@@ -32,6 +32,7 @@ import (
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
+	kustypes "sigs.k8s.io/kustomize/api/types"
 	"sigs.k8s.io/kustomize/kyaml/filesys"
 )
 
@@ -764,4 +765,296 @@ func TestAnnotateDeploymentsWithContentHash_FallsBackToLiveConfigMap(t *testing.
 	if !found || annotations[annotationConfigHash] == "" {
 		t.Fatal("expected hash annotation from live-fetched CA ConfigMap")
 	}
+}
+
+func findResource(resources []*unstructured.Unstructured, kind, name string) *unstructured.Unstructured {
+	for _, obj := range resources {
+		if obj.GetKind() == kind && obj.GetName() == name {
+			return obj
+		}
+	}
+	return nil
+}
+
+func mustResource(t *testing.T, resources []*unstructured.Unstructured, kind, name string) *unstructured.Unstructured {
+	t.Helper()
+	obj := findResource(resources, kind, name)
+	if obj == nil {
+		t.Fatalf("%s %q not found in rendered resources", kind, name)
+	}
+	return obj
+}
+
+func TestBuildFlightRenamePatches(t *testing.T) {
+	patches, err := buildFlightRenamePatches("default-dcs")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	wantTargets := map[string]string{
+		kindService:            nameFlightService,
+		kindDeployment:         nameFlightService,
+		kindNetworkPolicy:      nameFlightService,
+		kindServiceAccount:     nameFlightService + "-sa",
+		kindConfigMap:          nameFlightService + "-config",
+		kindClusterRoleBinding: "flight-auth-delegator",
+		kindHTTPRoute:          "data-connect-hub",
+	}
+	if len(patches) != len(wantTargets) {
+		t.Fatalf("patch count = %d, want %d", len(patches), len(wantTargets))
+	}
+	for _, p := range patches {
+		if p.Target == nil {
+			t.Fatalf("patch without target:\n%s", p.Patch)
+		}
+		baseName, ok := wantTargets[p.Target.Kind]
+		if !ok {
+			t.Errorf("unexpected patch target kind %q", p.Target.Kind)
+			continue
+		}
+		if p.Target.Name != baseName {
+			t.Errorf("%s patch target name = %q, want %q", p.Target.Kind, p.Target.Name, baseName)
+		}
+		if p.Options == nil || !p.Options.AllowNameChange {
+			t.Errorf("%s patch must set options.allowNameChange", p.Target.Kind)
+		}
+		// ConfigMap data and other arbitrary string fields are never touched.
+		if p.Target.Kind == kindConfigMap && strings.Contains(p.Patch, "\ndata:") {
+			t.Errorf("ConfigMap patch must not touch data:\n%s", p.Patch)
+		}
+		delete(wantTargets, p.Target.Kind)
+	}
+}
+
+// TestFlightRenamePatchesRendering is the contract test for the flight
+// instance renames: it renders both roots the controller may build, with the
+// rename patches combined with the other patches reconcileManifests injects
+// (in the same order), and asserts the resulting names, labels, selectors and
+// cross-resource references.
+func TestFlightRenamePatchesRendering(t *testing.T) {
+	manifestsPath := filepath.Join("..", "..", "..", "config")
+	crName := "default-dataconnectservice"
+	instance := flightServiceResourceName(crName)
+	prefixed := "dch-" + instance
+
+	imageParams := map[string]string{
+		RelatedImageRestService:   "registry.example.com/dch/rest@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+		RelatedImageFlightService: "registry.example.com/dch/flight@sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+		RelatedImageKubeRbacProxy: "registry.example.com/dch/kube-rbac-proxy@sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+	}
+
+	// The base render without rename patches is the reference for the fields
+	// the renames must leave untouched.
+	baseline, err := renderKustomization(manifestsPath, filepath.Join(manifestsPath, "base"), nil, nil, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	baselineCM := mustResource(t, baseline, kindConfigMap, "dch-"+nameFlightService+"-config")
+	baselineData, _, err := unstructured.NestedStringMap(baselineCM.Object, testDataKey)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	roots := []struct {
+		name string
+		path string
+	}{
+		{name: "base", path: filepath.Join(manifestsPath, "base")},
+		{name: "openshift overlay", path: filepath.Join(manifestsPath, "overlays", "openshift")},
+	}
+
+	for _, tt := range roots {
+		t.Run(tt.name, func(t *testing.T) {
+			var patches []kustypes.Patch
+			patches = append(patches, buildServicePatches(nameFlightService, nameFlightServiceContainer, &dchv1alpha1.ServiceOverrides{
+				Env: []corev1.EnvVar{{Name: "CUSTOM_VAR", Value: "custom-value"}},
+			})...)
+			patches = append(patches, buildGatewayPatches(&dchv1alpha1.Gateway{Name: "test-gateway", Namespace: "test-gw-ns"})...)
+			renamePatches, err := buildFlightRenamePatches(crName)
+			if err != nil {
+				t.Fatal(err)
+			}
+			patches = append(patches, renamePatches...)
+
+			resources, err := renderKustomization(manifestsPath, tt.path, patches, nil, imageParams)
+			if err != nil {
+				t.Fatalf("rendering %s: %v", tt.path, err)
+			}
+
+			assertInstanceLabels := func(labels map[string]string) {
+				t.Helper()
+				if got := labels[labelAppName]; got != instance {
+					t.Errorf("label %s = %q, want %q", labelAppName, got, instance)
+				}
+				if got := labels["app.kubernetes.io/part-of"]; got != "data-connect-hub" {
+					t.Errorf("label app.kubernetes.io/part-of = %q, want it preserved", got)
+				}
+			}
+
+			// Flight resources are renamed with the kustomize namePrefix kept.
+			svc := mustResource(t, resources, kindService, prefixed)
+			selector, _, err := unstructured.NestedStringMap(svc.Object, testSpecKey, "selector")
+			if err != nil {
+				t.Fatal(err)
+			}
+			if got := selector[labelAppName]; got != instance {
+				t.Errorf("Service selector = %v, want %q", selector, instance)
+			}
+			if got := svc.GetAnnotations()["service.beta.openshift.io/serving-cert-secret-name"]; got != instance+"-tls" {
+				t.Errorf("serving-cert secret annotation = %q, want %q", got, instance+"-tls")
+			}
+			assertInstanceLabels(svc.GetLabels())
+
+			dep := mustResource(t, resources, kindDeployment, prefixed)
+			saName, _, err := unstructured.NestedString(dep.Object, testSpecKey, "template", testSpecKey, "serviceAccountName")
+			if err != nil {
+				t.Fatal(err)
+			}
+			if saName != prefixed+"-sa" {
+				t.Errorf("Deployment serviceAccountName = %q, want %q", saName, prefixed+"-sa")
+			}
+			matchLabels, _, err := unstructured.NestedStringMap(dep.Object, testSpecKey, "selector", "matchLabels")
+			if err != nil {
+				t.Fatal(err)
+			}
+			if got := matchLabels[labelAppName]; got != instance {
+				t.Errorf("Deployment selector.matchLabels = %v, want %q", matchLabels, instance)
+			}
+			templateLabels, _, err := unstructured.NestedStringMap(dep.Object, testSpecKey, "template", testMetadataKey, "labels")
+			if err != nil {
+				t.Fatal(err)
+			}
+			if got := templateLabels[labelAppName]; got != instance {
+				t.Errorf("Deployment template labels = %v, want %q", templateLabels, instance)
+			}
+			volumes, _, _ := unstructured.NestedSlice(dep.Object, testSpecKey, "template", testSpecKey, "volumes")
+			volumeRef := map[string]string{}
+			for _, v := range volumes {
+				vol, ok := v.(map[string]any)
+				if !ok {
+					continue
+				}
+				if cm, ok := vol["configMap"].(map[string]any); ok {
+					volumeRef[vol[testNameKey].(string)] = "configmap:" + cm[testNameKey].(string)
+				}
+				if sec, ok := vol["secret"].(map[string]any); ok {
+					volumeRef[vol[testNameKey].(string)] = "secret:" + sec["secretName"].(string)
+				}
+			}
+			if got := volumeRef["config"]; got != "configmap:"+prefixed+"-config" {
+				t.Errorf("config volume = %q, want %q", got, "configmap:"+prefixed+"-config")
+			}
+			// The serving-cert secret is generated at runtime by service-ca,
+			// so it is not part of the kustomize output and carries no prefix.
+			if got := volumeRef["tls"]; got != "secret:"+instance+"-tls" {
+				t.Errorf("tls volume = %q, want %q", got, "secret:"+instance+"-tls")
+			}
+			assertInstanceLabels(dep.GetLabels())
+			// The ServiceOverrides patch still applies to the renamed Deployment.
+			if image, ok := renderedContainerImage(resources, nameFlightServiceContainer); !ok || image != imageParams[RelatedImageFlightService] {
+				t.Errorf("flight container image = %q, want %q", image, imageParams[RelatedImageFlightService])
+			}
+			env, found, _ := unstructured.NestedSlice(dep.Object, testSpecKey, "template", testSpecKey, "containers")
+			var customVar string
+			if found {
+				for _, c := range env {
+					container, ok := c.(map[string]any)
+					if !ok || container[testNameKey] != nameFlightServiceContainer {
+						continue
+					}
+					for _, e := range container["env"].([]any) {
+						entry, _ := e.(map[string]any)
+						if entry != nil && entry[testNameKey] == "CUSTOM_VAR" {
+							customVar, _ = entry["value"].(string)
+						}
+					}
+				}
+			}
+			if customVar != "custom-value" {
+				t.Errorf("ServiceOverrides env CUSTOM_VAR = %q, want it applied to the renamed Deployment", customVar)
+			}
+
+			np := mustResource(t, resources, kindNetworkPolicy, prefixed)
+			podSelector, _, err := unstructured.NestedStringMap(np.Object, testSpecKey, "podSelector", "matchLabels")
+			if err != nil {
+				t.Fatal(err)
+			}
+			if got := podSelector[labelAppName]; got != instance {
+				t.Errorf("NetworkPolicy podSelector = %v, want %q", podSelector, instance)
+			}
+
+			sa := mustResource(t, resources, kindServiceAccount, prefixed+"-sa")
+			if got := sa.GetLabels()[labelAppName]; got != instance {
+				t.Errorf("ServiceAccount label = %q, want %q", got, instance)
+			}
+
+			// ConfigMap data must be byte-identical to the unrenamed render.
+			cm := mustResource(t, resources, kindConfigMap, prefixed+"-config")
+			assertInstanceLabels(cm.GetLabels())
+			data, _, err := unstructured.NestedStringMap(cm.Object, testDataKey)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if data[testConfigTOMLKey] != baselineData[testConfigTOMLKey] {
+				t.Errorf("flight ConfigMap config.toml changed by rename patches")
+			}
+
+			crb := mustResource(t, resources, kindClusterRoleBinding, prefixed+"-auth-delegator")
+			subjects, _, _ := unstructured.NestedSlice(crb.Object, "subjects")
+			if len(subjects) != 1 {
+				t.Fatalf("ClusterRoleBinding subjects = %v, want exactly one", subjects)
+			}
+			subject, _ := subjects[0].(map[string]any)
+			if got := subject[testNameKey]; got != prefixed+"-sa" {
+				t.Errorf("ClusterRoleBinding subject name = %v, want %q", got, prefixed+"-sa")
+			}
+
+			route := mustResource(t, resources, kindHTTPRoute, "dch-"+crName+"-route")
+			parents, _, _ := unstructured.NestedSlice(route.Object, testSpecKey, "parentRefs")
+			parent, _ := parents[0].(map[string]any)
+			if parent["name"] != "test-gateway" || parent["namespace"] != "test-gw-ns" {
+				t.Errorf("HTTPRoute parentRefs = %v, want the gateway patch applied", parents)
+			}
+			rules, _, _ := unstructured.NestedSlice(route.Object, testSpecKey, "rules")
+			backendNames := map[string]bool{}
+			for _, r := range rules {
+				rule, _ := r.(map[string]any)
+				refs, _ := rule["backendRefs"].([]any)
+				for _, b := range refs {
+					ref, _ := b.(map[string]any)
+					backendNames[ref[testNameKey].(string)] = true
+				}
+			}
+			if !backendNames[prefixed] {
+				t.Errorf("HTTPRoute flight backendRef missing %q, got %v", prefixed, backendNames)
+			}
+			if !backendNames["dch-"+nameRestService] {
+				t.Errorf("HTTPRoute rest backendRef missing %q, got %v", "dch-"+nameRestService, backendNames)
+			}
+
+			// REST resources keep their base names and content.
+			mustResource(t, resources, kindDeployment, "dch-"+nameRestService)
+			mustResource(t, resources, kindServiceAccount, "dch-"+nameRestService+"-sa")
+			proxyCM := mustResource(t, resources, kindConfigMap, "dch-"+nameRestService+"-kube-rbac-proxy-config")
+			proxyData, _, _ := unstructured.NestedStringMap(proxyCM.Object, testDataKey)
+			if !strings.Contains(strings.Join(mapValues(proxyData), "\n"), "resource: flight-services") {
+				t.Errorf("rest kube-rbac-proxy config no longer references the flight-services CRD plural")
+			}
+
+			// No flight resource keeps its old base name.
+			for _, obj := range resources {
+				if strings.HasPrefix(obj.GetName(), "dch-"+nameFlightService) && obj.GetName() != "dch-flight-service-ca" {
+					t.Errorf("%s %q kept the base flight-service name", obj.GetKind(), obj.GetName())
+				}
+			}
+		})
+	}
+}
+
+func mapValues(m map[string]string) []string {
+	values := make([]string, 0, len(m))
+	for _, v := range m {
+		values = append(values, v)
+	}
+	return values
 }

@@ -44,6 +44,7 @@ import (
 	logf "sigs.k8s.io/controller-runtime/pkg/log"
 	"sigs.k8s.io/controller-runtime/pkg/predicate"
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
+	gatewayv1 "sigs.k8s.io/gateway-api/apis/v1"
 	kustypes "sigs.k8s.io/kustomize/api/types"
 	"sigs.k8s.io/yaml"
 
@@ -396,10 +397,19 @@ func (r *DataConnectServiceReconciler) reconcileManifests(
 	}
 	gwPatches := buildGatewayPatches(&gw)
 
-	patches := make([]kustypes.Patch, 0, len(restPatches)+len(flightPatches)+len(gwPatches))
+	// Flight instance rename patches must come last: the patches above target
+	// resources by their base names, which cease to match once the rename
+	// patches have run.
+	renamePatches, err := buildFlightRenamePatches(cr.Name)
+	if err != nil {
+		return fmt.Errorf("building flight rename patches: %w", err)
+	}
+
+	patches := make([]kustypes.Patch, 0, len(restPatches)+len(flightPatches)+len(gwPatches)+len(renamePatches))
 	patches = append(patches, restPatches...)
 	patches = append(patches, flightPatches...)
 	patches = append(patches, gwPatches...)
+	patches = append(patches, renamePatches...)
 
 	paramsEnvOverrides := map[string]string{
 		RelatedImageRestService:   r.RestImage,
@@ -411,7 +421,6 @@ func (r *DataConnectServiceReconciler) reconcileManifests(
 		return fmt.Errorf("rendering manifests: %w", err)
 	}
 
-	resources = renderFlightService(resources, cr.Name)
 	flightInstanceName := flightServiceResourceName(cr.Name)
 
 	if err := setConfigMapGlobalNamespace(resources, cr.Namespace); err != nil {
@@ -814,7 +823,7 @@ func (r *DataConnectServiceReconciler) http2Enabled(ctx context.Context) (enable
 func (r *DataConnectServiceReconciler) resolveGatewayHostname(ctx context.Context, namespace, name string) string {
 	gw := &unstructured.Unstructured{}
 	gw.SetGroupVersionKind(schema.GroupVersionKind{
-		Group:   "gateway.networking.k8s.io",
+		Group:   gatewayv1.GroupName,
 		Version: "v1",
 		Kind:    "Gateway",
 	})
