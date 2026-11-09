@@ -3,8 +3,10 @@ pub mod connection_types;
 pub mod connections;
 pub mod connector;
 pub mod creds;
+pub mod diagnostics;
 pub mod errors;
 pub mod flight_discovery;
+pub mod redact;
 pub mod secret;
 pub mod storage;
 

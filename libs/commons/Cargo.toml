@@ -25,3 +25,13 @@ opentelemetry = { workspace = true }
 opentelemetry_sdk = { workspace = true }
 opentelemetry-otlp = { workspace = true }
 tracing-opentelemetry = { workspace = true }
+base64 = { workspace = true }
+url = { workspace = true }
+tokio = { workspace = true, optional = true }
+
+[features]
+# Test helpers for connector crates; enable only from dev-dependencies.
+test-support = ["dep:tokio"]
+
+[dev-dependencies]
+tokio = { workspace = true }

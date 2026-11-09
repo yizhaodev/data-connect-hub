@@ -6,7 +6,9 @@ use arrow::record_batch::RecordBatch;
 
 use commons::api::connector::{DataReader, QueryOutput, TableInfo};
 use commons::api::connector::{Query, QueryOptions};
+use commons::api::diagnostics::error_chain;
 use commons::api::errors::ConnectorError;
+use commons::api::redact::{RedactingReader, Redactor};
 
 use futures::StreamExt;
 
@@ -21,7 +23,7 @@ use sqlx::{Column, Executor, Row, SqlitePool, Statement, TypeInfo};
 const KEY_URI: &str = "URI";
 
 pub struct SqliteConnector {
-    pools: Cache<String, SqlitePool>,
+    pools: Cache<String, (SqlitePool, Arc<Redactor>)>,
     config: ConnectorConfig,
 }
 
@@ -61,25 +63,64 @@ impl FlightConnector for SqliteConnector {
         let connection_timeout = self.config.connection_timeout();
         let cache_key = data_connection.metadata.id.clone();
 
-        let pool = self
+        let (pool, redactor) = self
             .pools
             .try_get_with(cache_key, async {
                 let credentials = credentials_resolver.resolve(data_connection).await?;
+                let redactor = Arc::new(Redactor::from_credentials(&credentials));
+                async {
+                    let url = credentials.get(KEY_URI).ok_or_else(|| {
+                        ConnectorError::ConnectionError(format!("'{KEY_URI}' credential is required"))
+                    })?;
 
-                let url = credentials
-                    .get(KEY_URI)
-                    .ok_or_else(|| ConnectorError::ConnectionError(format!("'{KEY_URI}' credential is required")))?;
-
-                sqlx::pool::PoolOptions::<sqlx::Sqlite>::new()
-                    .acquire_timeout(connection_timeout)
-                    .connect(url.as_str())
-                    .await
-                    .map_err(|e| ConnectorError::ConnectionError(format!("unable to connect to SQLite: {e}")))
+                    sqlx::pool::PoolOptions::<sqlx::Sqlite>::new()
+                        .acquire_timeout(connection_timeout)
+                        .connect(url.as_str())
+                        .await
+                        .map_err(|e| {
+                            ConnectorError::ConnectionError(format!(
+                                "unable to connect to SQLite: {}",
+                                map_sqlx_error(e).message()
+                            ))
+                        })
+                }
+                .await
+                .map(|pool| (pool, Arc::clone(&redactor)))
+                .map_err(|e| redactor.redact_error(e))
             })
             .await
             .map_err(|e| Arc::try_unwrap(e).unwrap_or_else(|arc| (*arc).clone()))?;
 
-        Ok(Arc::new(SqliteReader { pool }))
+        Ok(Arc::new(RedactingReader::new(SqliteReader { pool }, redactor)))
+    }
+}
+
+/// SQLITE_READONLY is the primary result code of a write attempted under
+/// `PRAGMA query_only`; extended codes keep it in the low byte.
+const SQLITE_READONLY: i32 = 8;
+
+/// map_sqlx_error classifies a sqlx error so the client sees whether its query
+/// was rejected or the database could not be opened, together with the
+/// reason.
+fn map_sqlx_error(e: sqlx::Error) -> ConnectorError {
+    match &e {
+        sqlx::Error::Database(db_err) => {
+            let code = db_err.code().and_then(|c| c.parse::<i32>().ok());
+            if code.is_some_and(|c| c & 0xff == SQLITE_READONLY) {
+                return ConnectorError::InvalidRequest("data source is read-only".to_string());
+            }
+            ConnectorError::SQLError(db_err.message().to_string())
+        },
+        sqlx::Error::Configuration(_) | sqlx::Error::Io(_) | sqlx::Error::Protocol(_) | sqlx::Error::PoolTimedOut => {
+            ConnectorError::ConnectionError(error_chain(&e))
+        },
+        sqlx::Error::InvalidArgument(_) => ConnectorError::InvalidRequest(e.to_string()),
+        sqlx::Error::ColumnDecode { .. }
+        | sqlx::Error::Decode(_)
+        | sqlx::Error::ColumnNotFound(_)
+        | sqlx::Error::ColumnIndexOutOfBounds { .. }
+        | sqlx::Error::TypeNotFound { .. } => ConnectorError::SQLError(error_chain(&e)),
+        _ => ConnectorError::internal("SQLite client error", error_chain(&e)),
     }
 }
 
@@ -95,11 +136,7 @@ impl DataReader for SqliteReader {
 
     #[tracing::instrument(skip_all, fields(connector.provider = PROVIDER))]
     async fn schema(&self, query: &str) -> Result<Arc<Query>, ConnectorError> {
-        let statement = self
-            .pool
-            .prepare(query)
-            .await
-            .map_err(|e| ConnectorError::SQLError(e.to_string()))?;
+        let statement = self.pool.prepare(query).await.map_err(map_sqlx_error)?;
 
         let fields: Vec<Field> = statement
             .columns()
@@ -118,17 +155,17 @@ impl DataReader for SqliteReader {
         let batch_size = options.batch_size;
 
         let stream = async_stream::try_stream! {
-            let mut conn = pool.acquire().await.map_err(|e| ConnectorError::ConnectionError(e.to_string()))?;
+            let mut conn = pool.acquire().await.map_err(map_sqlx_error)?;
             sqlx::query("PRAGMA query_only = ON")
                 .execute(&mut *conn)
                 .await
-                .map_err(|e| ConnectorError::SQLError(e.to_string()))?;
+                .map_err(map_sqlx_error)?;
 
             let mut rows = sqlx::query(query.as_str()).fetch(&mut *conn);
             let mut chunk = Vec::with_capacity(batch_size);
 
             while let Some(row) = rows.next().await {
-                chunk.push(row.map_err(|e| ConnectorError::SQLError(e.to_string()))?);
+                chunk.push(row.map_err(map_sqlx_error)?);
 
                 if chunk.len() >= batch_size {
                     yield rows_to_batch(&schema, &chunk)?;
@@ -146,10 +183,12 @@ impl DataReader for SqliteReader {
 
     #[tracing::instrument(skip_all, fields(connector.provider = PROVIDER))]
     async fn check_connection(&self) -> Result<(), ConnectorError> {
-        sqlx::query("SELECT 1")
-            .execute(&self.pool)
-            .await
-            .map_err(|e| ConnectorError::ConnectionError(format!("SQLite connection check failed: {e}")))?;
+        sqlx::query("SELECT 1").execute(&self.pool).await.map_err(|e| {
+            ConnectorError::ConnectionError(format!(
+                "SQLite connection check failed: {}",
+                map_sqlx_error(e).message()
+            ))
+        })?;
         Ok(())
     }
 
@@ -176,7 +215,7 @@ impl DataReader for SqliteReader {
             .bind(pattern)
             .fetch_all(&self.pool)
             .await
-            .map_err(|e| ConnectorError::SQLError(e.to_string()))?,
+            .map_err(map_sqlx_error)?,
             None => sqlx::query_as(
                 "SELECT name, type FROM sqlite_master \
                      WHERE type IN ('table', 'view') AND name NOT LIKE 'sqlite_%' \
@@ -184,18 +223,14 @@ impl DataReader for SqliteReader {
             )
             .fetch_all(&self.pool)
             .await
-            .map_err(|e| ConnectorError::SQLError(e.to_string()))?,
+            .map_err(map_sqlx_error)?,
         };
 
         let mut tables = Vec::with_capacity(rows.len());
         for (table_name, table_type) in rows {
             let table_schema = if include_schema {
                 let query = format!("SELECT * FROM \"{}\" LIMIT 0", table_name.replace('"', "\"\""));
-                let statement = self
-                    .pool
-                    .prepare(&query)
-                    .await
-                    .map_err(|e| ConnectorError::SQLError(e.to_string()))?;
+                let statement = self.pool.prepare(&query).await.map_err(map_sqlx_error)?;
 
                 let fields: Vec<Field> = statement
                     .columns()
@@ -230,7 +265,8 @@ fn rows_to_batch(schema: &Arc<Schema>, rows: &[SqliteRow]) -> Result<RecordBatch
         })
         .collect::<Result<_, _>>()?;
 
-    RecordBatch::try_new(Arc::clone(schema), arrays).map_err(|e| ConnectorError::SQLError(e.to_string()))
+    RecordBatch::try_new(Arc::clone(schema), arrays)
+        .map_err(|e| ConnectorError::internal("failed to assemble record batch", e))
 }
 
 fn sqlite_type_to_arrow(sqlite_type: &str) -> DataType {
@@ -244,7 +280,7 @@ fn sqlite_type_to_arrow(sqlite_type: &str) -> DataType {
 }
 
 fn build_array(sqlite_type: &str, rows: &[SqliteRow], col_idx: usize) -> Result<ArrayRef, ConnectorError> {
-    let err = |e: sqlx::Error| ConnectorError::SQLError(e.to_string());
+    let err = map_sqlx_error;
     match sqlite_type {
         "BOOLEAN" => {
             let vals: Vec<Option<bool>> = rows
@@ -331,5 +367,56 @@ mod tests {
     fn test_sqlite_connector_new() {
         let connector = SqliteConnector::new(ConnectorConfig::default());
         assert_eq!(connector.provider(), "sqlite");
+    }
+}
+
+#[cfg(test)]
+mod error_reporting_tests {
+    use super::*;
+    use arrow::datatypes::Schema;
+    use commons::test_support::{StaticCredentials, connection};
+
+    async fn reader(uri: &str) -> Result<Arc<dyn DataReader>, ConnectorError> {
+        SqliteConnector::new(ConnectorConfig::default())
+            .get_reader(&connection("sqlite-1", &[]), &StaticCredentials::new(&[("URI", uri)]))
+            .await
+    }
+
+    #[tokio::test]
+    async fn syntax_error_is_reported_as_rejected_query() {
+        let err = reader("sqlite::memory:")
+            .await
+            .unwrap()
+            .schema("BOGUS 1")
+            .await
+            .err()
+            .unwrap();
+        assert!(matches!(err, ConnectorError::SQLError(_)), "{err:?}");
+        assert!(err.message().contains("syntax error"), "{}", err.message());
+    }
+
+    #[tokio::test]
+    async fn write_is_rejected_as_read_only() {
+        let reader = reader("sqlite::memory:").await.unwrap();
+        let query = Arc::new(Query::new(
+            "CREATE TABLE t (x INTEGER)".to_string(),
+            Arc::new(Schema::empty()),
+        ));
+        let mut stream = reader.read_tabular(query, &QueryOptions::default()).await.unwrap();
+        let err = stream.next().await.unwrap().unwrap_err();
+        assert!(matches!(err, ConnectorError::InvalidRequest(_)), "{err:?}");
+        assert_eq!(err.message(), "data source is read-only");
+    }
+
+    #[tokio::test]
+    async fn unopenable_database_reports_the_cause() {
+        let err = reader("sqlite:///nonexistent-dir/db.sqlite?mode=ro")
+            .await
+            .err()
+            .unwrap();
+        assert!(matches!(err, ConnectorError::ConnectionError(_)), "{err:?}");
+        let msg = err.message();
+        assert!(msg.starts_with("unable to connect to SQLite: "), "{msg}");
+        assert!(msg.contains("unable to open database file"), "{msg}");
     }
 }

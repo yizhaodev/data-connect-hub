@@ -9,7 +9,9 @@ use arrow::record_batch::RecordBatch;
 use commons::api::connections::{DataConnectionResource, DataFormat};
 use commons::api::connector::CredentialsResolver;
 use commons::api::connector::{BinaryQuery, DataReader, FlightConnector, Query, QueryOptions, QueryOutput};
+use commons::api::diagnostics::{body_excerpt, error_chain};
 use commons::api::errors::ConnectorError;
+use commons::api::redact::{RedactingReader, Redactor};
 use commons::utils::config::ConnectorConfig;
 use format_readers::FileFormat;
 use moka::future::Cache;
@@ -60,7 +62,7 @@ impl UriClient {
 }
 
 pub struct UriConnector {
-    clients: Cache<String, UriClient>,
+    clients: Cache<String, (UriClient, Arc<Redactor>)>,
     config: ConnectorConfig,
 }
 
@@ -98,13 +100,13 @@ fn build_client(credentials: &HashMap<String, String>, config: ConnectorConfig) 
 
     if let Some(ca_pem) = credentials.get(KEY_CA_CERT) {
         let cert = reqwest::tls::Certificate::from_pem(ca_pem.as_bytes())
-            .map_err(|e| ConnectorError::ConnectionError(format!("Invalid CA certificate: {e}")))?;
+            .map_err(|e| ConnectorError::ConnectionError(format!("Invalid CA certificate: {}", error_chain(&e))))?;
         builder = builder.add_root_certificate(cert);
     }
 
     let http = builder
         .build()
-        .map_err(|e| ConnectorError::ConnectionError(format!("Failed to build HTTP client: {e}")))?;
+        .map_err(|e| ConnectorError::ConnectionError(format!("Failed to build HTTP client: {}", error_chain(&e))))?;
 
     let auth = if let Some(token) = credentials.get(KEY_TOKEN) {
         UriAuth::Token { token: token.clone() }
@@ -150,19 +152,23 @@ impl FlightConnector for UriConnector {
     ) -> Result<Arc<dyn DataReader>, ConnectorError> {
         let cache_key = data_connection.metadata.id.clone();
 
-        let client = self
+        let (client, redactor) = self
             .clients
             .try_get_with(cache_key, async {
                 let credentials = credentials_resolver.resolve(data_connection).await?;
+                let redactor = Arc::new(Redactor::from_credentials(&credentials));
                 build_client(&credentials, self.config)
+                    .map(|client| (client, Arc::clone(&redactor)))
+                    .map_err(|e| redactor.redact_error(e))
             })
             .await
             .map_err(|e| Arc::try_unwrap(e).unwrap_or_else(|arc| (*arc).clone()))?;
 
-        Ok(Arc::new(UriReader {
+        let reader = UriReader {
             client,
             cached_response: tokio::sync::Mutex::new(None),
-        }))
+        };
+        Ok(Arc::new(RedactingReader::new(reader, redactor)))
     }
 }
 
@@ -199,25 +205,51 @@ fn detect_format(
         return Ok(format);
     }
 
-    Err(ConnectorError::ConnectionError(
+    Err(ConnectorError::InvalidRequest(
         "Cannot determine response format. Set 'format' in query or ensure the server returns a recognized Content-Type header.".to_string(),
     ))
 }
 
-async fn fetch_response(client: &UriClient, request: &UriRequest) -> Result<CachedResponse, ConnectorError> {
-    let response = client
-        .request(reqwest::Method::GET, &request.path)?
-        .send()
+/// send sends `req` for `path`, reporting the transport-level cause (DNS,
+/// refused connection, TLS, timeout) on failure.
+async fn send(req: reqwest::RequestBuilder, method: &str, path: &str) -> Result<reqwest::Response, ConnectorError> {
+    req.send()
         .await
-        .map_err(|e| ConnectorError::ConnectionError(format!("HTTP request failed: {e}")))?;
+        .map_err(|e| ConnectorError::ConnectionError(format!("HTTP {method} '{path}' failed: {}", error_chain(&e))))
+}
 
+/// ensure_success turns an error status into a client-actionable error,
+/// quoting an excerpt of the response body when there is one.
+async fn ensure_success(
+    response: reqwest::Response,
+    method: &str,
+    path: &str,
+) -> Result<reqwest::Response, ConnectorError> {
     let status = response.status();
-    if !status.is_success() {
-        let body = response.text().await.unwrap_or_default();
-        return Err(ConnectorError::ConnectionError(format!(
-            "HTTP request failed (status {status}): {body}"
-        )));
+    if status.is_success() {
+        return Ok(response);
     }
+    if status == reqwest::StatusCode::NOT_FOUND {
+        return Err(ConnectorError::NotFound(format!("'{path}' not found")));
+    }
+    let detail = match response.text().await {
+        Ok(body) if !body.trim().is_empty() => format!(": {}", body_excerpt(&body)),
+        Ok(_) => String::new(),
+        Err(e) => format!(" (reading the response failed: {})", error_chain(&e)),
+    };
+    Err(ConnectorError::ConnectionError(format!(
+        "HTTP {method} '{path}' failed (HTTP {status}){detail}"
+    )))
+}
+
+async fn fetch_response(client: &UriClient, request: &UriRequest) -> Result<CachedResponse, ConnectorError> {
+    let response = send(
+        client.request(reqwest::Method::GET, &request.path)?,
+        "GET",
+        &request.path,
+    )
+    .await?;
+    let response = ensure_success(response, "GET", &request.path).await?;
 
     let format = detect_format(response.headers().get(reqwest::header::CONTENT_TYPE), request)?;
 
@@ -229,10 +261,13 @@ async fn fetch_response(client: &UriClient, request: &UriRequest) -> Result<Cach
         )));
     }
 
-    let bytes = response
-        .bytes()
-        .await
-        .map_err(|e| ConnectorError::ConnectionError(format!("Failed to read response: {e}")))?;
+    let bytes = response.bytes().await.map_err(|e| {
+        ConnectorError::ConnectionError(format!(
+            "HTTP GET '{}' failed: reading the response: {}",
+            request.path,
+            error_chain(&e)
+        ))
+    })?;
 
     if bytes.len() as u64 > MAX_RESPONSE_BYTES {
         return Err(ConnectorError::ConnectionError(format!(
@@ -246,13 +281,13 @@ async fn fetch_response(client: &UriClient, request: &UriRequest) -> Result<Cach
 
 async fn bytes_to_opendal_reader(data: bytes::Bytes) -> Result<opendal::Reader, ConnectorError> {
     let op = opendal::Operator::new(opendal::services::Memory::default())
-        .map_err(|e| ConnectorError::IOError(format!("Failed to create memory operator: {e}")))?;
+        .map_err(|e| ConnectorError::internal("failed to buffer HTTP response", e))?;
     op.write("data", data)
         .await
-        .map_err(|e| ConnectorError::IOError(format!("Failed to buffer response: {e}")))?;
+        .map_err(|e| ConnectorError::internal("failed to buffer HTTP response", e))?;
     op.reader("data")
         .await
-        .map_err(|e| ConnectorError::IOError(format!("Failed to create reader: {e}")))
+        .map_err(|e| ConnectorError::internal("failed to buffer HTTP response", e))
 }
 
 #[async_trait::async_trait]
@@ -320,60 +355,39 @@ impl DataReader for UriReader {
 
     #[tracing::instrument(skip_all, fields(connector.provider = PROVIDER, storage.object.path = %query.path))]
     async fn can_read_binary(&self, query: Arc<BinaryQuery>) -> Result<(), ConnectorError> {
-        let response = self
-            .client
-            .request(reqwest::Method::HEAD, &query.path)?
-            .send()
-            .await
-            .map_err(|e| ConnectorError::ConnectionError(format!("HTTP HEAD failed: {e}")))?;
-
-        let status = response.status();
-        if status == reqwest::StatusCode::NOT_FOUND {
-            return Err(ConnectorError::NotFound(format!("'{}' not found", query.path)));
-        }
-        if !status.is_success() {
-            return Err(ConnectorError::IOError(format!(
-                "Cannot read '{}': HTTP {status}",
-                query.path
-            )));
-        }
+        let response = send(
+            self.client.request(reqwest::Method::HEAD, &query.path)?,
+            "HEAD",
+            &query.path,
+        )
+        .await?;
+        ensure_success(response, "HEAD", &query.path).await?;
         Ok(())
     }
 
     #[tracing::instrument(skip_all, fields(connector.provider = PROVIDER, storage.object.path = %query.path))]
     async fn read_binary(&self, query: Arc<BinaryQuery>) -> QueryOutput {
-        let response = self
+        let request = self
             .client
             .request(reqwest::Method::GET, &query.path)?
-            .timeout(Duration::from_secs(24 * 60 * 60))
-            .send()
-            .await
-            .map_err(|e| ConnectorError::ConnectionError(format!("HTTP request failed: {e}")))?;
-
-        let status = response.status();
-        if status == reqwest::StatusCode::NOT_FOUND {
-            return Err(ConnectorError::NotFound(format!("'{}' not found", query.path)));
-        }
-        if !status.is_success() {
-            let body = response.text().await.unwrap_or_default();
-            return Err(ConnectorError::ConnectionError(format!(
-                "HTTP request failed (status {status}): {body}"
-            )));
-        }
+            .timeout(Duration::from_secs(24 * 60 * 60));
+        let response = send(request, "GET", &query.path).await?;
+        let response = ensure_success(response, "GET", &query.path).await?;
 
         let schema = Arc::new(Schema::new(vec![Field::new("data", ArrowDataType::Binary, false)]));
 
         let mut byte_stream = response.bytes_stream();
+        let path = query.path.clone();
 
         let stream = async_stream::try_stream! {
             use futures::StreamExt;
             while let Some(result) = byte_stream.next().await {
                 let chunk = result
-                    .map_err(|e| ConnectorError::IOError(format!("Stream read error: {e}")))?;
+                    .map_err(|e| ConnectorError::IOError(format!("reading '{path}' failed: {}", error_chain(&e))))?;
                 let data: &[u8] = &chunk;
                 let array = BinaryArray::from_vec(vec![data]);
                 let batch = RecordBatch::try_new(schema.clone(), vec![Arc::new(array)])
-                    .map_err(|e| ConnectorError::IOError(format!("Failed to create batch: {e}")))?;
+                    .map_err(|e| ConnectorError::internal("failed to build binary record batch", e))?;
                 yield batch;
             }
         };
@@ -383,17 +397,14 @@ impl DataReader for UriReader {
 
     #[tracing::instrument(skip_all, fields(connector.provider = PROVIDER))]
     async fn check_connection(&self) -> Result<(), ConnectorError> {
-        let response = self
-            .client
-            .request(reqwest::Method::HEAD, "")?
-            .send()
-            .await
-            .map_err(|e| ConnectorError::ConnectionError(format!("Connection test failed: {e}")))?;
+        let response = send(self.client.request(reqwest::Method::HEAD, "")?, "HEAD", "/").await?;
 
+        // Only authentication failures disqualify the connection; the base
+        // URI itself need not be a readable resource.
         let status = response.status();
         if status == reqwest::StatusCode::UNAUTHORIZED || status == reqwest::StatusCode::FORBIDDEN {
             return Err(ConnectorError::ConnectionError(format!(
-                "Authentication failed (HTTP {status})"
+                "authentication failed (HTTP {status})"
             )));
         }
         Ok(())
@@ -621,5 +632,116 @@ mod tests {
             .request(reqwest::Method::GET, "http://example.com/admin")
             .unwrap_err();
         assert!(err.to_string().contains("escape the base URI"));
+    }
+}
+
+#[cfg(test)]
+mod error_reporting_tests {
+    use super::*;
+    use base64::Engine as _;
+    use commons::test_support::{ECHO_HEADERS, MockHttpServer, StaticCredentials, connection};
+
+    const SECRET: &str = "LEAK-SENTINEL-uri-secret";
+    const CSV_QUERY: &str = r#"{"path":"data.csv"}"#;
+
+    async fn reader(creds: &[(&str, &str)]) -> Arc<dyn DataReader> {
+        UriConnector::new(
+            Duration::from_secs(60),
+            Duration::from_secs(60),
+            10,
+            ConnectorConfig::default(),
+        )
+        .get_reader(&connection("uri-1", &[]), &StaticCredentials::new(creds))
+        .await
+        .unwrap()
+    }
+
+    #[test]
+    fn invalid_ca_certificate_reports_the_cause() {
+        let creds = HashMap::from([
+            (KEY_URI.to_string(), "https://example.com".to_string()),
+            (
+                KEY_CA_CERT.to_string(),
+                "-----BEGIN CERTIFICATE-----\nnot base64!!\n-----END CERTIFICATE-----\n".to_string(),
+            ),
+        ]);
+        let err = build_client(&creds, ConnectorConfig::default()).err().unwrap();
+        let msg = err.message();
+        // reqwest prints only "builder error" at the top level.
+        assert!(!msg.ends_with("builder error"), "{msg}");
+    }
+
+    #[tokio::test]
+    async fn unreachable_host_reports_the_cause() {
+        let err = reader(&[("URI", "http://127.0.0.1:1/files")])
+            .await
+            .check_connection()
+            .await
+            .unwrap_err();
+        let msg = err.message();
+        assert!(msg.starts_with("HTTP HEAD '/' failed: "), "{msg}");
+        assert!(msg.to_lowercase().contains("connection refused"), "{msg}");
+    }
+
+    #[tokio::test]
+    async fn missing_resource_is_not_found() {
+        let server = MockHttpServer::start(404, "").await;
+        let err = reader(&[("URI", &server.url())])
+            .await
+            .schema(CSV_QUERY)
+            .await
+            .err()
+            .unwrap();
+        assert!(matches!(err, ConnectorError::NotFound(_)), "{err:?}");
+        assert_eq!(err.message(), "'data.csv' not found");
+    }
+
+    #[tokio::test]
+    async fn error_status_quotes_a_body_excerpt() {
+        let server = MockHttpServer::start(502, "<html>\n  <h1>Bad Gateway</h1>\n</html>").await;
+        let err = reader(&[("URI", &server.url())])
+            .await
+            .schema(CSV_QUERY)
+            .await
+            .err()
+            .unwrap();
+        assert_eq!(
+            err.message(),
+            "HTTP GET 'data.csv' failed (HTTP 502 Bad Gateway): <html> <h1>Bad Gateway</h1> </html>"
+        );
+    }
+
+    #[tokio::test]
+    async fn echoed_token_is_redacted() {
+        let server = MockHttpServer::start(401, &format!("denied: {ECHO_HEADERS}")).await;
+        let msg = reader(&[("URI", &server.url()), ("TOKEN", SECRET)])
+            .await
+            .schema(CSV_QUERY)
+            .await
+            .err()
+            .unwrap()
+            .message()
+            .to_string();
+        assert!(msg.contains("HTTP 401"), "{msg}");
+        assert!(msg.contains("authorization: Bearer ***"), "{msg}");
+        assert!(!msg.contains(SECRET), "{msg}");
+    }
+
+    #[tokio::test]
+    async fn echoed_uri_userinfo_is_redacted() {
+        let server = MockHttpServer::start(403, &format!("denied: {ECHO_HEADERS}")).await;
+        let uri = server.url().replace("http://", &format!("http://bob:{SECRET}@"));
+        let msg = reader(&[("URI", &uri)])
+            .await
+            .schema(CSV_QUERY)
+            .await
+            .err()
+            .unwrap()
+            .message()
+            .to_string();
+        let encoded = base64::engine::general_purpose::STANDARD.encode(format!("bob:{SECRET}"));
+        assert!(msg.contains("HTTP 403"), "{msg}");
+        assert!(msg.contains("authorization: Basic ***"), "{msg}");
+        assert!(!msg.contains(SECRET) && !msg.contains(&encoded), "{msg}");
     }
 }

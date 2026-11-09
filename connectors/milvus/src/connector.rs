@@ -9,7 +9,9 @@ use commons::api::arrow_convert::json_values_to_array;
 use commons::api::connections::DataConnectionResource;
 use commons::api::connector::CredentialsResolver;
 use commons::api::connector::{DataReader, FlightConnector, Query, QueryOptions, QueryOutput};
+use commons::api::diagnostics::{body_excerpt, error_chain};
 use commons::api::errors::ConnectorError;
+use commons::api::redact::{RedactingReader, Redactor};
 use commons::utils::config::ConnectorConfig;
 use moka::future::Cache;
 
@@ -40,32 +42,46 @@ impl MilvusClient {
             req = req.bearer_auth(token);
         }
 
-        let response = req
-            .json(&body)
-            .send()
-            .await
-            .map_err(|e| ConnectorError::ConnectionError(format!("Milvus request failed: {e}")))?;
+        let response = req.json(&body).send().await.map_err(|e| {
+            ConnectorError::ConnectionError(format!("Milvus request {path} failed: {}", error_chain(&e)))
+        })?;
 
         let status = response.status();
-        let body = response
-            .text()
-            .await
-            .map_err(|e| ConnectorError::ConnectionError(format!("Failed to read Milvus response body: {e}")))?;
+        let body = response.text().await.map_err(|e| {
+            ConnectorError::ConnectionError(format!(
+                "Milvus request {path} failed: reading the response: {}",
+                error_chain(&e)
+            ))
+        })?;
 
+        let json = serde_json::from_str::<serde_json::Value>(&body);
         if !status.is_success() {
+            // A non-2xx status comes from the HTTP layer in front of the
+            // Milvus API (wrong URI, proxy, authentication), not from a
+            // rejected request.
+            let detail = json
+                .as_ref()
+                .ok()
+                .and_then(milvus_message)
+                .map_or_else(|| body_excerpt(&body), |m| body_excerpt(&m));
             return Err(ConnectorError::ConnectionError(format!(
-                "Milvus error (HTTP {status}): {body}"
+                "Milvus request {path} failed (HTTP {status}): {detail}"
             )));
         }
 
-        let json: serde_json::Value = serde_json::from_str(&body)
-            .map_err(|e| ConnectorError::ConnectionError(format!("Failed to parse Milvus response: {e}")))?;
+        let json = json.map_err(|e| {
+            ConnectorError::ConnectionError(format!(
+                "Milvus request {path} failed: unexpected response ({e}): {}",
+                body_excerpt(&body)
+            ))
+        })?;
 
         let code = json.get("code").and_then(|c| c.as_i64()).unwrap_or(0);
         if code != 0 {
-            let message = json.get("message").and_then(|m| m.as_str()).unwrap_or("unknown error");
-            return Err(ConnectorError::ConnectionError(format!(
-                "Milvus error (code {code}): {message}"
+            let message = milvus_message(&json).unwrap_or_else(|| "no error message".to_string());
+            return Err(ConnectorError::SQLError(format!(
+                "Milvus rejected request {path} (code {code}): {}",
+                body_excerpt(&message)
             )));
         }
 
@@ -73,8 +89,13 @@ impl MilvusClient {
     }
 }
 
+/// milvus_message returns the `message` field of a Milvus REST response.
+fn milvus_message(json: &serde_json::Value) -> Option<String> {
+    json.get("message").and_then(|m| m.as_str()).map(str::to_string)
+}
+
 pub struct MilvusConnector {
-    clients: Cache<String, MilvusClient>,
+    clients: Cache<String, (MilvusClient, Arc<Redactor>)>,
     config: ConnectorConfig,
 }
 
@@ -117,44 +138,50 @@ impl FlightConnector for MilvusConnector {
     ) -> Result<Arc<dyn DataReader>, ConnectorError> {
         let cache_key = data_connection.metadata.id.clone();
 
-        let client = self
+        let (client, redactor) = self
             .clients
             .try_get_with(cache_key, async {
                 let credentials = credentials_resolver.resolve(data_connection).await?;
+                let redactor = Arc::new(Redactor::from_credentials(&credentials));
+                async {
+                    let base_url = credentials
+                        .get(KEY_URI)
+                        .ok_or_else(|| ConnectorError::ConnectionError(format!("'{KEY_URI}' credential is required")))?
+                        .clone();
+                    let token = credentials.get(KEY_TOKEN).cloned();
+                    let database = credentials.get(KEY_DATABASE).cloned();
 
-                let base_url = credentials
-                    .get(KEY_URI)
-                    .ok_or_else(|| ConnectorError::ConnectionError(format!("'{KEY_URI}' credential is required")))?
-                    .clone();
-                let token = credentials.get(KEY_TOKEN).cloned();
-                let database = credentials.get(KEY_DATABASE).cloned();
+                    let mut builder = reqwest::Client::builder()
+                        .connect_timeout(self.config.connection_timeout())
+                        .read_timeout(self.config.read_timeout())
+                        .timeout(self.config.request_timeout());
 
-                let mut builder = reqwest::Client::builder()
-                    .connect_timeout(self.config.connection_timeout())
-                    .read_timeout(self.config.read_timeout())
-                    .timeout(self.config.request_timeout());
+                    if let Some(ca_pem) = credentials.get(KEY_CA_CERT) {
+                        let cert = reqwest::tls::Certificate::from_pem(ca_pem.as_bytes()).map_err(|e| {
+                            ConnectorError::ConnectionError(format!("Invalid CA certificate: {}", error_chain(&e)))
+                        })?;
+                        builder = builder.add_root_certificate(cert);
+                    }
 
-                if let Some(ca_pem) = credentials.get(KEY_CA_CERT) {
-                    let cert = reqwest::tls::Certificate::from_pem(ca_pem.as_bytes())
-                        .map_err(|e| ConnectorError::ConnectionError(format!("Invalid CA certificate: {e}")))?;
-                    builder = builder.add_root_certificate(cert);
+                    let http = builder.build().map_err(|e| {
+                        ConnectorError::ConnectionError(format!("Failed to build HTTP client: {}", error_chain(&e)))
+                    })?;
+
+                    Ok::<_, ConnectorError>(MilvusClient {
+                        http,
+                        base_url,
+                        token,
+                        database,
+                    })
                 }
-
-                let http = builder
-                    .build()
-                    .map_err(|e| ConnectorError::ConnectionError(format!("Failed to build HTTP client: {e}")))?;
-
-                Ok::<_, ConnectorError>(MilvusClient {
-                    http,
-                    base_url,
-                    token,
-                    database,
-                })
+                .await
+                .map(|client| (client, Arc::clone(&redactor)))
+                .map_err(|e| redactor.redact_error(e))
             })
             .await
             .map_err(|e| Arc::try_unwrap(e).unwrap_or_else(|arc| (*arc).clone()))?;
 
-        Ok(Arc::new(MilvusReader { client }))
+        Ok(Arc::new(RedactingReader::new(MilvusReader { client }, redactor)))
     }
 }
 
@@ -211,9 +238,13 @@ impl DataReader for MilvusReader {
 
     #[tracing::instrument(skip_all, fields(connector.provider = PROVIDER))]
     async fn check_connection(&self) -> Result<(), ConnectorError> {
+        // Any failure here means the connection settings do not work, even
+        // when Milvus answered with an API error such as an authentication
+        // failure.
         self.client
             .execute("/v2/vectordb/collections/list", serde_json::json!({}))
-            .await?;
+            .await
+            .map_err(|e| ConnectorError::ConnectionError(e.message().to_string()))?;
         Ok(())
     }
 }
@@ -380,7 +411,8 @@ fn rows_to_record_batch(schema: &Arc<Schema>, rows: &[serde_json::Value]) -> Res
         })
         .collect::<Result<_, _>>()?;
 
-    RecordBatch::try_new(Arc::clone(schema), arrays).map_err(|e| ConnectorError::SQLError(e.to_string()))
+    RecordBatch::try_new(Arc::clone(schema), arrays)
+        .map_err(|e| ConnectorError::internal("failed to assemble record batch", e))
 }
 
 #[cfg(test)]
@@ -615,5 +647,80 @@ mod tests {
             "/v2/vectordb/entities/search"
         );
         assert_eq!(operation_endpoint(&MilvusOperation::Get), "/v2/vectordb/entities/get");
+    }
+}
+
+#[cfg(test)]
+mod error_reporting_tests {
+    use super::*;
+    use commons::test_support::{ECHO_HEADERS, MockHttpServer, StaticCredentials, connection};
+
+    const SECRET: &str = "LEAK-SENTINEL-milvus-token";
+
+    async fn reader(uri: &str) -> Arc<dyn DataReader> {
+        MilvusConnector::new(
+            Duration::from_secs(60),
+            Duration::from_secs(60),
+            10,
+            ConnectorConfig::default(),
+        )
+        .get_reader(
+            &connection("milvus-1", &[]),
+            &StaticCredentials::new(&[("URI", uri), ("TOKEN", SECRET)]),
+        )
+        .await
+        .unwrap()
+    }
+
+    #[tokio::test]
+    async fn unreachable_host_reports_the_cause() {
+        let err = reader("http://127.0.0.1:1").await.check_connection().await.unwrap_err();
+        let msg = err.message();
+        assert!(matches!(err, ConnectorError::ConnectionError(_)));
+        assert!(
+            msg.starts_with("Milvus request /v2/vectordb/collections/list failed: "),
+            "{msg}"
+        );
+        assert!(msg.to_lowercase().contains("connection refused"), "{msg}");
+    }
+
+    #[tokio::test]
+    async fn api_error_is_reported_as_rejected_request() {
+        let server =
+            MockHttpServer::start(200, r#"{"code":100,"message":"collection not found[collection=docs]"}"#).await;
+        let err = reader(&server.url())
+            .await
+            .schema(r#"{"collectionName":"docs"}"#)
+            .await
+            .err()
+            .unwrap();
+        assert!(matches!(err, ConnectorError::SQLError(_)), "{err:?}");
+        assert_eq!(
+            err.message(),
+            "Milvus rejected request /v2/vectordb/collections/describe (code 100): collection not found[collection=docs]"
+        );
+    }
+
+    #[tokio::test]
+    async fn check_connection_reports_api_errors_as_connection_errors() {
+        let server = MockHttpServer::start(200, r#"{"code":1800,"message":"user hasn't authenticated"}"#).await;
+        let err = reader(&server.url()).await.check_connection().await.unwrap_err();
+        assert!(matches!(err, ConnectorError::ConnectionError(_)), "{err:?}");
+        assert!(err.message().contains("user hasn't authenticated"), "{}", err.message());
+    }
+
+    #[tokio::test]
+    async fn echoed_token_is_redacted() {
+        let server = MockHttpServer::start(401, &format!("denied, got: {ECHO_HEADERS}")).await;
+        let msg = reader(&server.url())
+            .await
+            .check_connection()
+            .await
+            .unwrap_err()
+            .message()
+            .to_string();
+        assert!(msg.contains("HTTP 401"), "{msg}");
+        assert!(msg.contains("authorization: Bearer ***"), "{msg}");
+        assert!(!msg.contains(SECRET), "{msg}");
     }
 }

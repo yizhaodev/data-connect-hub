@@ -12,7 +12,9 @@ use arrow::record_batch::RecordBatch;
 use commons::api::connections::DataConnectionResource;
 use commons::api::connector::CredentialsResolver;
 use commons::api::connector::{DataReader, FlightConnector, Query, QueryOptions, QueryOutput};
+use commons::api::diagnostics::error_chain;
 use commons::api::errors::ConnectorError;
+use commons::api::redact::{RedactingReader, Redactor};
 use commons::utils::config::ConnectorConfig;
 use futures::Stream;
 use moka::future::Cache;
@@ -28,7 +30,7 @@ const KEY_DATABASE: &str = "DATABASE";
 const KEY_CA_CERT: &str = "CA_CERT";
 
 pub struct Neo4jConnector {
-    graphs: Cache<String, Graph>,
+    graphs: Cache<String, (Graph, Arc<Redactor>)>,
     config: ConnectorConfig,
 }
 
@@ -84,24 +86,31 @@ async fn build_graph(
     // alive until Graph::connect has built its TLS connector and loaded the
     // certificate; NamedTempFile then removes it automatically.
     let _ca_cert_file = if let Some(ca_cert_pem) = credentials.get(KEY_CA_CERT) {
-        let mut file = NamedTempFile::new()
-            .map_err(|e| ConnectorError::IOError(format!("Failed to create temporary Neo4j CA certificate: {e}")))?;
+        let mut file =
+            NamedTempFile::new().map_err(|e| ConnectorError::internal("failed to prepare Neo4j CA certificate", e))?;
         file.write_all(ca_cert_pem.as_bytes())
-            .map_err(|e| ConnectorError::IOError(format!("Failed to write temporary Neo4j CA certificate: {e}")))?;
+            .map_err(|e| ConnectorError::internal("failed to prepare Neo4j CA certificate", e))?;
         builder = builder.with_client_certificate(file.path());
         Some(file)
     } else {
         None
     };
 
-    let config = builder
-        .build()
-        .map_err(|e| ConnectorError::ConnectionError(format!("Invalid Neo4j config: {e}")))?;
+    let config = builder.build().map_err(|e| {
+        ConnectorError::ConnectionError(format!("invalid Neo4j connection settings: {}", error_chain(&e)))
+    })?;
 
     tokio::time::timeout(connection_timeout, Graph::connect(config))
         .await
-        .map_err(|_| ConnectorError::ConnectionError("Connection timeout".to_string()))?
-        .map_err(|e| ConnectorError::ConnectionError(format!("Failed to connect to Neo4j: {e}")))
+        .map_err(|_| {
+            ConnectorError::ConnectionError(format!(
+                "timed out connecting to Neo4j after {}s",
+                connection_timeout.as_secs()
+            ))
+        })?
+        .map_err(|e| {
+            ConnectorError::ConnectionError(format!("unable to connect to Neo4j: {}", map_neo4j_error(e).message()))
+        })
 }
 
 const PROVIDER: &str = "neo4j";
@@ -132,16 +141,20 @@ impl FlightConnector for Neo4jConnector {
 
         let cache_key = data_connection.metadata.id.clone();
 
-        let graph = self
+        let (graph, redactor) = self
             .graphs
             .try_get_with(cache_key, async {
                 let credentials = credentials_resolver.resolve(data_connection).await?;
-                build_graph(&credentials, connection_timeout).await
+                let redactor = Arc::new(Redactor::from_credentials(&credentials));
+                build_graph(&credentials, connection_timeout)
+                    .await
+                    .map(|client| (client, Arc::clone(&redactor)))
+                    .map_err(|e| redactor.redact_error(e))
             })
             .await
             .map_err(|e| Arc::try_unwrap(e).unwrap_or_else(|arc| (*arc).clone()))?;
 
-        Ok(Arc::new(Neo4jReader { graph }))
+        Ok(Arc::new(RedactingReader::new(Neo4jReader { graph }, redactor)))
     }
 }
 
@@ -245,16 +258,49 @@ impl DataReader for Neo4jReader {
     }
 }
 
+/// map_neo4j_error classifies a neo4rs error so the client sees whether its
+/// query was rejected or the database could not be reached, together with the
+/// reason.
 fn map_neo4j_error(e: neo4rs::Error) -> ConnectorError {
-    let msg = e.to_string().to_lowercase();
-    if msg.contains("permission")
-        || msg.contains("not allowed")
-        || msg.contains("read only")
-        || msg.contains("write operations are not allowed")
-    {
-        return ConnectorError::InvalidRequest("Data source is read-only".to_string());
+    match &e {
+        neo4rs::Error::Neo4j(server) => classify_server_error(server.code(), server.message()),
+        neo4rs::Error::IOError { .. }
+        | neo4rs::Error::ConnectionError
+        | neo4rs::Error::AuthenticationError(_)
+        | neo4rs::Error::UrlParseError(_)
+        | neo4rs::Error::UnsupportedScheme(_)
+        | neo4rs::Error::InvalidDnsName(_)
+        | neo4rs::Error::InvalidConfig
+        | neo4rs::Error::UnsupportedVersion(_)
+        | neo4rs::Error::UnexpectedMessage(_)
+        | neo4rs::Error::UnknownMessage(_) => ConnectorError::ConnectionError(error_chain(&e)),
+        neo4rs::Error::DeserializationError(_)
+        | neo4rs::Error::ConversionError
+        | neo4rs::Error::UnknownType(_)
+        | neo4rs::Error::InvalidTypeMarker(_) => ConnectorError::SQLError(error_chain(&e)),
+        _ => ConnectorError::internal("Neo4j client error", error_chain(&e)),
     }
-    ConnectorError::SQLError(e.to_string())
+}
+
+/// classify_server_error maps an error reported by the Neo4j server by its
+/// status code (`Neo.<Classification>.<Category>.<Title>`), keeping the
+/// server's message and code.
+fn classify_server_error(code: &str, message: &str) -> ConnectorError {
+    let text = format!("{message} ({code})");
+    match code {
+        "Neo.ClientError.Statement.AccessMode" => {
+            ConnectorError::InvalidRequest(format!("data source is read-only: {text}"))
+        },
+        "Neo.ClientError.Security.Forbidden" => ConnectorError::InvalidRequest(format!("permission denied: {text}")),
+        // Authentication failures and a wrong DATABASE setting are problems
+        // with the connection settings, not with the query.
+        c if c.starts_with("Neo.ClientError.Security.") || c == "Neo.ClientError.Database.DatabaseNotFound" => {
+            ConnectorError::ConnectionError(text)
+        },
+        c if c.starts_with("Neo.ClientError.") => ConnectorError::SQLError(text),
+        // TransientError and DatabaseError are failures on the server side.
+        _ => ConnectorError::ConnectionError(text),
+    }
 }
 
 fn rows_to_record_batch(schema: &Arc<Schema>, rows: &[neo4rs::Row]) -> Result<RecordBatch, ConnectorError> {
@@ -264,7 +310,8 @@ fn rows_to_record_batch(schema: &Arc<Schema>, rows: &[neo4rs::Row]) -> Result<Re
         .map(|field| build_column_array(field.name(), field.data_type(), rows))
         .collect::<Result<_, _>>()?;
 
-    RecordBatch::try_new(Arc::clone(schema), arrays).map_err(|e| ConnectorError::SQLError(e.to_string()))
+    RecordBatch::try_new(Arc::clone(schema), arrays)
+        .map_err(|e| ConnectorError::internal("failed to assemble record batch", e))
 }
 
 fn build_column_array(
@@ -387,9 +434,64 @@ mod tests {
     }
 
     #[test]
-    fn test_map_neo4j_error_permission_denied() {
-        let err = map_neo4j_error(neo4rs::Error::UnsupportedScheme("permission denied".into()));
+    fn test_classify_server_error_read_only() {
+        let err = classify_server_error(
+            "Neo.ClientError.Statement.AccessMode",
+            "Writing in read access mode not allowed.",
+        );
         assert!(matches!(err, ConnectorError::InvalidRequest(_)));
+        let err = classify_server_error(
+            "Neo.ClientError.Security.Forbidden",
+            "Write operations are not allowed for user 'reader' with roles [reader].",
+        );
+        assert!(matches!(err, ConnectorError::InvalidRequest(_)));
+        assert_eq!(
+            err.message(),
+            "permission denied: Write operations are not allowed for user 'reader' with roles [reader]. (Neo.ClientError.Security.Forbidden)"
+        );
+    }
+
+    #[test]
+    fn test_classify_server_error_connection_settings() {
+        for code in [
+            "Neo.ClientError.Security.Unauthorized",
+            "Neo.ClientError.Security.AuthenticationRateLimit",
+            "Neo.ClientError.Database.DatabaseNotFound",
+            "Neo.TransientError.General.DatabaseUnavailable",
+            "Neo.DatabaseError.General.UnknownError",
+        ] {
+            assert!(
+                matches!(classify_server_error(code, "x"), ConnectorError::ConnectionError(_)),
+                "{code}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_classify_server_error_rejected_query() {
+        let err = classify_server_error("Neo.ClientError.Statement.SyntaxError", "Invalid input 'BOGUS'");
+        assert!(matches!(err, ConnectorError::SQLError(_)));
+        assert_eq!(
+            err.message(),
+            "Invalid input 'BOGUS' (Neo.ClientError.Statement.SyntaxError)"
+        );
+    }
+
+    #[test]
+    fn test_map_neo4j_error_client_side_is_not_read_only() {
+        let err = map_neo4j_error(neo4rs::Error::UnsupportedScheme("permission denied".into()));
+        assert!(matches!(err, ConnectorError::ConnectionError(_)));
+    }
+
+    #[test]
+    fn test_map_neo4j_error_io_reports_the_cause() {
+        let io = std::io::Error::new(
+            std::io::ErrorKind::ConnectionRefused,
+            "Connection refused (os error 111)",
+        );
+        let err = map_neo4j_error(neo4rs::Error::IOError { detail: io });
+        assert!(matches!(err, ConnectorError::ConnectionError(_)));
+        assert_eq!(err.message(), "an IO error occurred: Connection refused (os error 111)");
     }
 
     #[test]

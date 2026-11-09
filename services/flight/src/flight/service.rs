@@ -752,7 +752,7 @@ impl CredentialsResolver for DataIngestionService {
                     .secret_store
                     .get_secret(tenant_id, secret)
                     .await
-                    .map_err(|e| ConnectorError::ConnectionError(e.to_string()))?;
+                    .map_err(|e| ConnectorError::internal("failed to resolve connection credentials", e))?;
                 Ok(secret.properties.clone())
             },
             _ => Err(ConnectorError::ConnectionError("No credentials found".to_string())),

@@ -9,7 +9,9 @@ use commons::api::arrow_convert::json_values_to_array;
 use commons::api::connections::DataConnectionResource;
 use commons::api::connector::CredentialsResolver;
 use commons::api::connector::{DataReader, FlightConnector, Query, QueryOptions, QueryOutput};
+use commons::api::diagnostics::{body_excerpt, error_chain};
 use commons::api::errors::ConnectorError;
+use commons::api::redact::{RedactingReader, Redactor, truncate_message};
 use commons::utils::config::ConnectorConfig;
 use moka::future::Cache;
 
@@ -68,7 +70,7 @@ impl EsClient {
 }
 
 pub struct ElasticsearchConnector {
-    clients: Cache<String, EsClient>,
+    clients: Cache<String, (EsClient, Arc<Redactor>)>,
     config: ConnectorConfig,
 }
 
@@ -98,13 +100,13 @@ fn build_client(credentials: &HashMap<String, String>, config: ConnectorConfig) 
 
     if let Some(ca_pem) = credentials.get(KEY_CA_CERT) {
         let cert = reqwest::tls::Certificate::from_pem(ca_pem.as_bytes())
-            .map_err(|e| ConnectorError::ConnectionError(format!("Invalid CA certificate: {e}")))?;
+            .map_err(|e| ConnectorError::ConnectionError(format!("Invalid CA certificate: {}", error_chain(&e))))?;
         builder = builder.add_root_certificate(cert);
     }
 
     let http = builder
         .build()
-        .map_err(|e| ConnectorError::ConnectionError(format!("Failed to build HTTP client: {e}")))?;
+        .map_err(|e| ConnectorError::ConnectionError(format!("Failed to build HTTP client: {}", error_chain(&e))))?;
 
     let auth = if let Some(encoded) = credentials.get(KEY_API_KEY) {
         EsAuth::ApiKey {
@@ -146,18 +148,24 @@ impl FlightConnector for ElasticsearchConnector {
     ) -> Result<Arc<dyn DataReader>, ConnectorError> {
         let cache_key = data_connection.metadata.id.clone();
 
-        let client = self
+        let (client, redactor) = self
             .clients
             .try_get_with(cache_key, async {
                 let credentials = credentials_resolver.resolve(data_connection).await?;
+                let redactor = Arc::new(Redactor::from_credentials(&credentials));
                 build_client(&credentials, self.config)
+                    .map(|client| (client, Arc::clone(&redactor)))
+                    .map_err(|e| redactor.redact_error(e))
             })
             .await
             .map_err(|e| Arc::try_unwrap(e).unwrap_or_else(|arc| (*arc).clone()))?;
 
         let default_index = data_connection.resource.properties.get("index").cloned();
 
-        Ok(Arc::new(ElasticsearchReader { client, default_index }))
+        Ok(Arc::new(RedactingReader::new(
+            ElasticsearchReader { client, default_index },
+            redactor,
+        )))
     }
 }
 
@@ -177,25 +185,11 @@ impl DataReader for ElasticsearchReader {
         let request = EsRequestInput::parse(query)?;
         let index = request.resolve_index(self.default_index.as_deref())?;
 
-        let response = self
-            .client
-            .get(&format!("/{}/_mapping", index))
-            .send()
-            .await
-            .map_err(|e| ConnectorError::ConnectionError(format!("Failed to get mapping: {e}")))?;
-
-        let status = response.status();
-        if !status.is_success() {
-            let body = response.text().await.unwrap_or_default();
-            return Err(ConnectorError::ConnectionError(format!(
-                "Mapping request failed (HTTP {status}): {body}"
-            )));
-        }
-
-        let mapping_json: serde_json::Value = response
-            .json()
-            .await
-            .map_err(|e| ConnectorError::ConnectionError(format!("Failed to parse mapping response: {e}")))?;
+        let mapping_json = send_json(
+            self.client.get(&format!("/{}/_mapping", index)),
+            &format!("get mapping of index '{index}'"),
+        )
+        .await?;
 
         let mapping_fields = types::parse_mapping(&mapping_json);
 
@@ -217,14 +211,11 @@ impl DataReader for ElasticsearchReader {
         let client = self.client.clone();
 
         let stream = async_stream::try_stream! {
-            let pit_response: serde_json::Value = client
-                .post(&format!("/{}/_pit?keep_alive=5m", index))
-                .send()
-                .await
-                .map_err(|e| ConnectorError::ConnectionError(format!("Failed to open PIT: {e}")))?
-                .json()
-                .await
-                .map_err(|e| ConnectorError::ConnectionError(format!("Failed to parse PIT response: {e}")))?;
+            let pit_response = send_json(
+                client.post(&format!("/{}/_pit?keep_alive=5m", index)),
+                &format!("open point in time on index '{index}'"),
+            )
+            .await?;
 
             let pit_id = pit_response
                 .get("id")
@@ -300,47 +291,93 @@ impl DataReader for ElasticsearchReader {
 
     #[tracing::instrument(skip_all, fields(connector.provider = PROVIDER))]
     async fn check_connection(&self) -> Result<(), ConnectorError> {
-        let response = self
-            .client
-            .get("/")
-            .send()
+        // Any failure here means the connection settings do not work,
+        // whatever status Elasticsearch answered with.
+        send(self.client.get("/"), "connection check")
             .await
-            .map_err(|e| ConnectorError::ConnectionError(format!("Connection test failed: {e}")))?;
-
-        if !response.status().is_success() {
-            return Err(ConnectorError::ConnectionError(format!(
-                "Elasticsearch returned HTTP {}",
-                response.status()
-            )));
-        }
-
+            .map_err(|e| ConnectorError::ConnectionError(e.message().to_string()))?;
         Ok(())
     }
 }
 
-async fn fetch_search_page(client: &EsClient, body: serde_json::Value) -> Result<serde_json::Value, ConnectorError> {
-    let response = client
-        .post("/_search")
-        .json(&body)
+/// send sends `req` and returns the response body, turning transport
+/// failures and error statuses into client-actionable errors. `action` names
+/// the request in the message.
+async fn send(req: reqwest::RequestBuilder, action: &str) -> Result<String, ConnectorError> {
+    let response = req
         .send()
         .await
-        .map_err(|e| ConnectorError::ConnectionError(format!("Search failed: {e}")))?;
+        .map_err(|e| ConnectorError::ConnectionError(format!("{action} failed: {}", error_chain(&e))))?;
     let status = response.status();
-    let json: serde_json::Value = response
-        .json()
-        .await
-        .map_err(|e| ConnectorError::ConnectionError(format!("Failed to parse search response: {e}")))?;
+    let body = response.text().await.map_err(|e| {
+        ConnectorError::ConnectionError(format!("{action} failed: reading the response: {}", error_chain(&e)))
+    })?;
     if !status.is_success() {
-        let reason = json
-            .get("error")
-            .and_then(|e| e.get("reason"))
-            .and_then(|r| r.as_str())
-            .unwrap_or("unknown error");
-        return Err(ConnectorError::SQLError(format!(
-            "Search failed (HTTP {status}): {reason}"
-        )));
+        return Err(http_error(action, status, &body));
     }
-    Ok(json)
+    Ok(body)
+}
+
+/// send_json is [`send`] for requests whose response must be a JSON document.
+async fn send_json(req: reqwest::RequestBuilder, action: &str) -> Result<serde_json::Value, ConnectorError> {
+    let body = send(req, action).await?;
+    serde_json::from_str(&body).map_err(|e| {
+        ConnectorError::ConnectionError(format!(
+            "{action} failed: Elasticsearch returned an unexpected response ({e}): {}",
+            body_excerpt(&body)
+        ))
+    })
+}
+
+fn http_error(action: &str, status: reqwest::StatusCode, body: &str) -> ConnectorError {
+    let message = format!("{action} failed (HTTP {status}): {}", es_error_detail(body));
+    match status {
+        reqwest::StatusCode::UNAUTHORIZED | reqwest::StatusCode::FORBIDDEN => ConnectorError::ConnectionError(message),
+        reqwest::StatusCode::NOT_FOUND => ConnectorError::NotFound(message),
+        s if s.is_client_error() => ConnectorError::SQLError(message),
+        _ => ConnectorError::ConnectionError(message),
+    }
+}
+
+/// es_error_detail extracts `type: reason` from an Elasticsearch error body,
+/// adding the first root cause when it says more, e.g. the parse error behind
+/// `search_phase_execution_exception: all shards failed`. A body that is not
+/// an Elasticsearch error, such as a proxy error page, is quoted as an
+/// excerpt.
+fn es_error_detail(body: &str) -> String {
+    let error = serde_json::from_str::<serde_json::Value>(body)
+        .ok()
+        .and_then(|json| json.get("error").cloned());
+    let Some(error) = error else {
+        return body_excerpt(body);
+    };
+    if let Some(text) = error.as_str() {
+        return body_excerpt(text);
+    }
+    let describe = |e: &serde_json::Value| -> Option<String> {
+        let reason = e.get("reason")?.as_str()?;
+        Some(match e.get("type").and_then(|t| t.as_str()) {
+            Some(kind) => format!("{kind}: {reason}"),
+            None => reason.to_string(),
+        })
+    };
+    let top = describe(&error);
+    let root = error.get("root_cause").and_then(|r| r.get(0)).and_then(describe);
+    let detail = match (top, root) {
+        (Some(top), Some(root)) if top != root => format!("{top} (root cause: {root})"),
+        (Some(top), _) => top,
+        (None, Some(root)) => root,
+        (None, None) => return body_excerpt(body),
+    };
+    truncate_message(&detail, MAX_ERROR_DETAIL_BYTES)
+}
+
+/// MAX_ERROR_DETAIL_BYTES caps the Elasticsearch error detail quoted in a
+/// message. Reasons may quote the offending query.
+const MAX_ERROR_DETAIL_BYTES: usize = 512;
+
+async fn fetch_search_page(client: &EsClient, body: serde_json::Value) -> Result<serde_json::Value, ConnectorError> {
+    send_json(client.post("/_search").json(&body), "search").await
 }
 
 async fn close_pit(client: &EsClient, pit_id: &str) {
@@ -350,7 +387,7 @@ async fn close_pit(client: &EsClient, pit_id: &str) {
         .send()
         .await
     {
-        tracing::error!("Failed to close PIT: {e}");
+        tracing::error!(error = %error_chain(&e), "failed to close point in time");
     }
 }
 
@@ -361,7 +398,8 @@ fn hits_to_record_batch(schema: &Arc<Schema>, hits: &[serde_json::Value]) -> Res
         .map(|field| extract_column_from_hits(field.name(), field.data_type(), hits))
         .collect::<Result<_, _>>()?;
 
-    RecordBatch::try_new(Arc::clone(schema), arrays).map_err(|e| ConnectorError::SQLError(e.to_string()))
+    RecordBatch::try_new(Arc::clone(schema), arrays)
+        .map_err(|e| ConnectorError::internal("failed to assemble record batch", e))
 }
 
 fn extract_column_from_hits(
@@ -522,5 +560,99 @@ mod tests {
         let msg = err.to_string();
         assert!(msg.contains("score"), "should name the field: {msg}");
         assert!(msg.contains("300"), "should include the value: {msg}");
+    }
+}
+
+#[cfg(test)]
+mod error_reporting_tests {
+    use super::*;
+    use base64::Engine as _;
+    use commons::test_support::{ECHO_HEADERS, MockHttpServer, StaticCredentials, connection};
+
+    const SECRET: &str = "LEAK-SENTINEL-es-pw";
+
+    async fn reader(uri: &str, extra: &[(&str, &str)]) -> Arc<dyn DataReader> {
+        let mut creds = vec![("URI", uri)];
+        creds.extend_from_slice(extra);
+        ElasticsearchConnector::new(
+            Duration::from_secs(60),
+            Duration::from_secs(60),
+            10,
+            ConnectorConfig::default(),
+        )
+        .get_reader(
+            &connection("es-1", &[("index", "docs")]),
+            &StaticCredentials::new(&creds),
+        )
+        .await
+        .unwrap()
+    }
+
+    #[test]
+    fn es_error_detail_prefers_type_and_root_cause() {
+        let body = r#"{"error":{"root_cause":[{"type":"parsing_exception","reason":"unknown query [bogus]"}],
+            "type":"search_phase_execution_exception","reason":"all shards failed"},"status":400}"#;
+        assert_eq!(
+            es_error_detail(body),
+            "search_phase_execution_exception: all shards failed (root cause: parsing_exception: unknown query [bogus])"
+        );
+
+        let body = r#"{"error":{"root_cause":[{"type":"index_not_found_exception","reason":"no such index [x]"}],
+            "type":"index_not_found_exception","reason":"no such index [x]"},"status":404}"#;
+        assert_eq!(es_error_detail(body), "index_not_found_exception: no such index [x]");
+
+        assert_eq!(
+            es_error_detail("<html>\n502 Bad Gateway\n</html>"),
+            "<html> 502 Bad Gateway </html>"
+        );
+    }
+
+    #[tokio::test]
+    async fn unreachable_host_reports_the_cause() {
+        let err = reader("http://127.0.0.1:1", &[])
+            .await
+            .check_connection()
+            .await
+            .unwrap_err();
+        assert!(matches!(err, ConnectorError::ConnectionError(_)));
+        let msg = err.message();
+        assert!(msg.starts_with("connection check failed: "), "{msg}");
+        assert!(msg.to_lowercase().contains("connection refused"), "{msg}");
+    }
+
+    #[tokio::test]
+    async fn missing_index_is_not_found_with_reason() {
+        let server = MockHttpServer::start(
+            404,
+            r#"{"error":{"type":"index_not_found_exception","reason":"no such index [docs]"},"status":404}"#,
+        )
+        .await;
+        let err = reader(&server.url(), &[]).await.schema("{}").await.err().unwrap();
+        assert!(matches!(err, ConnectorError::NotFound(_)), "{err:?}");
+        assert_eq!(
+            err.message(),
+            "get mapping of index 'docs' failed (HTTP 404 Not Found): index_not_found_exception: no such index [docs]"
+        );
+    }
+
+    #[tokio::test]
+    async fn echoed_basic_auth_is_redacted() {
+        let server = MockHttpServer::start(401, &format!("unauthorized, got: {ECHO_HEADERS}")).await;
+        let reader = reader(&server.url(), &[("USERNAME", "elastic"), ("PASSWORD", SECRET)]).await;
+        let msg = reader.check_connection().await.unwrap_err().message().to_string();
+        let encoded = base64::engine::general_purpose::STANDARD.encode(format!("elastic:{SECRET}"));
+        assert!(msg.contains("HTTP 401"), "{msg}");
+        assert!(msg.contains("authorization: Basic ***"), "{msg}");
+        assert!(!msg.contains(SECRET) && !msg.contains(&encoded), "{msg}");
+    }
+
+    #[tokio::test]
+    async fn echoed_api_key_is_redacted() {
+        let server = MockHttpServer::start(403, &format!("forbidden, got: {ECHO_HEADERS}")).await;
+        let reader = reader(&server.url(), &[("API_KEY", SECRET)]).await;
+        let msg = reader.check_connection().await.unwrap_err().message().to_string();
+        assert!(msg.contains("HTTP 403"), "{msg}");
+        assert!(msg.contains("authorization: ApiKey ***"), "{msg}");
+        assert!(!msg.contains(SECRET), "{msg}");
     }
 }

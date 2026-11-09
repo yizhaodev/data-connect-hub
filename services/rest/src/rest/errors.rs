@@ -95,11 +95,16 @@ impl From<ConnectorError> for RestErrorResponse {
             ConnectorError::IOError(_) => ("io_error", 500),
             ConnectorError::NotFound(_) => ("not_found", 404),
             ConnectorError::UnsupportedOperation(_) => ("unsupported_operation", 501),
+            ConnectorError::Internal { .. } => ("internal", 500),
         };
         let message = match &err {
             ConnectorError::IOError(_) => {
                 tracing::error!("{err}");
                 "data source I/O error".to_string()
+            },
+            ConnectorError::Internal { .. } => {
+                tracing::error!("{err}");
+                err.message().to_string()
             },
             _ => err.message().to_string(),
         };

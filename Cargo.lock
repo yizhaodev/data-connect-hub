@@ -1048,6 +1048,7 @@ dependencies = [
  "arrow",
  "arrow-cast",
  "async-trait",
+ "base64 0.22.1",
  "chrono",
  "futures",
  "opentelemetry",
@@ -1056,10 +1057,12 @@ dependencies = [
  "serde",
  "serde_json",
  "thiserror 2.0.21",
+ "tokio",
  "tonic",
  "tracing",
  "tracing-opentelemetry",
  "tracing-subscriber",
+ "url",
 ]
 
 [[package]]
@@ -1529,6 +1532,7 @@ dependencies = [
  "arrow",
  "async-stream",
  "async-trait",
+ "base64 0.22.1",
  "commons",
  "futures",
  "moka",
@@ -5804,6 +5808,7 @@ dependencies = [
  "arrow",
  "async-stream",
  "async-trait",
+ "base64 0.22.1",
  "bytes",
  "chrono",
  "commons",

@@ -9,7 +9,9 @@ use arrow::record_batch::RecordBatch;
 use commons::api::connections::DataConnectionResource;
 use commons::api::connector::{DataReader, QueryOutput, TableInfo};
 use commons::api::connector::{Query, QueryOptions};
+use commons::api::diagnostics::error_chain;
 use commons::api::errors::ConnectorError;
+use commons::api::redact::{RedactingReader, Redactor};
 
 use futures::StreamExt;
 
@@ -20,6 +22,7 @@ use moka::future::Cache;
 use sqlx::Acquire;
 use sqlx::postgres::{PgConnectOptions, PgRow};
 use sqlx::{Column, Executor, PgPool, Row, Statement, TypeInfo};
+use std::collections::HashMap;
 use std::str::FromStr;
 use std::time::Duration;
 use tracing::info;
@@ -30,17 +33,70 @@ const PG_READ_ONLY_SQL_TRANSACTION: &str = "25006";
 const KEY_URI: &str = "URI";
 const KEY_CA_CERT: &str = "CA_CERT";
 
+/// SQLSTATE classes that mean the server could not serve the request at all
+/// (connection exception, invalid authorization, insufficient resources,
+/// operator intervention, system error), rather than rejecting the query.
+const PG_UNAVAILABLE_CLASSES: &[&str] = &["08", "28", "53", "57", "58"];
+/// `query_canceled` is in an "unavailable" class but is usually a statement
+/// timeout the client can avoid with a narrower query.
+const PG_QUERY_CANCELED: &str = "57014";
+
+/// map_sqlx_error classifies a sqlx error so the client sees whether its query
+/// was rejected or the database could not be reached, together with the
+/// server's reason.
 pub(crate) fn map_sqlx_error(e: sqlx::Error) -> ConnectorError {
-    if let sqlx::Error::Database(ref db_err) = e
-        && db_err.code().as_deref() == Some(PG_READ_ONLY_SQL_TRANSACTION)
-    {
-        return ConnectorError::InvalidRequest("data source is read-only".to_string());
+    match &e {
+        sqlx::Error::Database(db_err) => {
+            let code = db_err.code().map(|c| c.into_owned()).unwrap_or_default();
+            if code == PG_READ_ONLY_SQL_TRANSACTION {
+                return ConnectorError::InvalidRequest("data source is read-only".to_string());
+            }
+            let hint = db_err
+                .try_downcast_ref::<sqlx::postgres::PgDatabaseError>()
+                .and_then(|pg| pg.hint());
+            classify_database_error(&code, db_err.message(), hint)
+        },
+        sqlx::Error::Configuration(_) => {
+            ConnectorError::ConnectionError(format!("invalid PostgreSQL connection settings: {}", error_chain(&e)))
+        },
+        sqlx::Error::Io(_) | sqlx::Error::Tls(_) | sqlx::Error::Protocol(_) => {
+            ConnectorError::ConnectionError(error_chain(&e))
+        },
+        sqlx::Error::PoolTimedOut => ConnectorError::ConnectionError(
+            "timed out waiting for a PostgreSQL connection; the server may be unreachable or overloaded".to_string(),
+        ),
+        sqlx::Error::InvalidArgument(_) => ConnectorError::InvalidRequest(e.to_string()),
+        // The query ran but a value could not be converted; casting the
+        // column in the query (e.g. `col::text`) works around it.
+        sqlx::Error::ColumnDecode { .. }
+        | sqlx::Error::Decode(_)
+        | sqlx::Error::ColumnNotFound(_)
+        | sqlx::Error::ColumnIndexOutOfBounds { .. }
+        | sqlx::Error::TypeNotFound { .. } => ConnectorError::SQLError(error_chain(&e)),
+        _ => ConnectorError::internal("PostgreSQL client error", error_chain(&e)),
     }
-    ConnectorError::SQLError(e.to_string())
+}
+
+/// classify_database_error maps an error reported by the PostgreSQL server,
+/// keeping its message, SQLSTATE and hint.
+fn classify_database_error(code: &str, message: &str, hint: Option<&str>) -> ConnectorError {
+    let mut text = message.to_string();
+    if !code.is_empty() {
+        text.push_str(&format!(" (SQLSTATE {code})"));
+    }
+    if let Some(hint) = hint {
+        text.push_str(&format!("; hint: {hint}"));
+    }
+    let class = code.get(..2).unwrap_or_default();
+    if code != PG_QUERY_CANCELED && PG_UNAVAILABLE_CLASSES.contains(&class) {
+        ConnectorError::ConnectionError(text)
+    } else {
+        ConnectorError::SQLError(text)
+    }
 }
 
 pub struct PgConnector {
-    pools: Cache<String, PgPool>,
+    pools: Cache<String, (PgPool, Arc<Redactor>)>,
     config: ConnectorConfig,
 }
 
@@ -85,31 +141,75 @@ impl FlightConnector for PgConnector {
         let connection_timeout = self.config.connection_timeout();
         let cache_key = data_connection.metadata.id.clone();
 
-        let pool = self
+        let (pool, redactor) = self
             .pools
             .try_get_with(cache_key, async {
                 let credentials = credentials_resolver.resolve(data_connection).await?;
-                let url = credentials
-                    .get(KEY_URI)
-                    .ok_or_else(|| ConnectorError::ConnectionError(format!("'{KEY_URI}' credential is required")))?;
-
-                let mut options = PgConnectOptions::from_str(url.as_str())
-                    .map_err(|e| ConnectorError::ConnectionError(format!("invalid PostgreSQL URL: {e}")))?;
-
-                if let Some(ca_cert) = credentials.get(KEY_CA_CERT) {
-                    options = options.ssl_root_cert_from_pem(ca_cert.as_bytes().to_vec());
-                }
-
-                sqlx::pool::PoolOptions::<sqlx::Postgres>::new()
-                    .acquire_timeout(connection_timeout)
-                    .connect_with(options)
+                let redactor = Arc::new(Redactor::from_credentials(&credentials));
+                connect_pg(&credentials, connection_timeout)
                     .await
-                    .map_err(|e| ConnectorError::ConnectionError(format!("unable to connect to PostgreSQL: {e}")))
+                    .map(|pool| (pool, Arc::clone(&redactor)))
+                    .map_err(|e| redactor.redact_error(e))
             })
             .await
             .map_err(|e| Arc::try_unwrap(e).unwrap_or_else(|arc| (*arc).clone()))?;
 
-        Ok(Arc::new(PgReader { pool }))
+        Ok(Arc::new(RedactingReader::new(PgReader { pool }, redactor)))
+    }
+}
+
+async fn connect_pg(
+    credentials: &HashMap<String, String>,
+    connection_timeout: Duration,
+) -> Result<PgPool, ConnectorError> {
+    let url = credentials
+        .get(KEY_URI)
+        .ok_or_else(|| ConnectorError::ConnectionError(format!("'{KEY_URI}' credential is required")))?;
+
+    let mut options = PgConnectOptions::from_str(url.as_str())
+        .map_err(|e| ConnectorError::ConnectionError(format!("invalid PostgreSQL URL: {}", error_chain(&e))))?;
+
+    if let Some(ca_cert) = credentials.get(KEY_CA_CERT) {
+        options = options.ssl_root_cert_from_pem(ca_cert.as_bytes().to_vec());
+    }
+
+    // Equivalent to `connect_with`, but keeps the pool so a timeout can be
+    // explained by `diagnose`.
+    let pool = sqlx::pool::PoolOptions::<sqlx::Postgres>::new()
+        .acquire_timeout(connection_timeout)
+        .connect_lazy_with(options);
+    match pool.acquire().await {
+        Ok(_) => Ok(pool),
+        Err(e) => {
+            let message = diagnose(&pool, e).await.message().to_string();
+            Err(ConnectorError::ConnectionError(format!(
+                "unable to connect to PostgreSQL: {message}"
+            )))
+        },
+    }
+}
+
+/// diagnose maps a sqlx error like [`map_sqlx_error`], but explains a pool
+/// timeout. sqlx keeps retrying retryable connect failures (refused
+/// connection, unknown host) until the acquire timeout and then reports only
+/// `PoolTimedOut`; a single direct connection attempt recovers the cause.
+async fn diagnose(pool: &PgPool, e: sqlx::Error) -> ConnectorError {
+    if !matches!(e, sqlx::Error::PoolTimedOut) {
+        return map_sqlx_error(e);
+    }
+    let timeout = pool.options().get_acquire_timeout();
+    let options = pool.connect_options();
+    match tokio::time::timeout(
+        timeout,
+        <sqlx::PgConnection as sqlx::Connection>::connect_with(&options),
+    )
+    .await
+    {
+        Ok(Err(cause)) => ConnectorError::ConnectionError(format!(
+            "timed out waiting for a PostgreSQL connection: {}",
+            map_sqlx_error(cause).message()
+        )),
+        _ => map_sqlx_error(e),
     }
 }
 
@@ -127,7 +227,10 @@ impl DataReader for PgReader {
 
     #[tracing::instrument(skip_all, fields(connector.provider = PROVIDER))]
     async fn schema(&self, query: &str) -> Result<Arc<Query>, ConnectorError> {
-        let statement = self.pool.prepare(query).await.map_err(map_sqlx_error)?;
+        let statement = match self.pool.prepare(query).await {
+            Ok(statement) => statement,
+            Err(e) => return Err(diagnose(&self.pool, e).await),
+        };
 
         let fields: Vec<Field> = statement
             .columns()
@@ -146,7 +249,10 @@ impl DataReader for PgReader {
         let batch_size = options.batch_size;
 
         let stream = async_stream::try_stream! {
-            let mut conn = pool.acquire().await.map_err(|e| ConnectorError::ConnectionError(e.to_string()))?;
+            let mut conn = match pool.acquire().await {
+                Ok(conn) => conn,
+                Err(e) => Err(diagnose(&pool, e).await)?,
+            };
             let mut tx = conn.begin().await.map_err(map_sqlx_error)?;
             sqlx::query("SET TRANSACTION READ ONLY")
                 .execute(&mut *tx)
@@ -179,10 +285,12 @@ impl DataReader for PgReader {
 
     #[tracing::instrument(skip_all, fields(connector.provider = PROVIDER))]
     async fn check_connection(&self) -> Result<(), ConnectorError> {
-        sqlx::query("SELECT 1")
-            .execute(&self.pool)
-            .await
-            .map_err(|_| ConnectorError::ConnectionError("PostgreSQL connection check failed".to_string()))?;
+        if let Err(e) = sqlx::query("SELECT 1").execute(&self.pool).await {
+            return Err(ConnectorError::ConnectionError(format!(
+                "PostgreSQL connection check failed: {}",
+                diagnose(&self.pool, e).await.message()
+            )));
+        }
         Ok(())
     }
 
@@ -266,7 +374,8 @@ fn rows_to_batch(schema: &Arc<Schema>, rows: &[PgRow]) -> Result<RecordBatch, Co
         })
         .collect::<Result<_, _>>()?;
 
-    RecordBatch::try_new(Arc::clone(schema), arrays).map_err(|e| ConnectorError::SQLError(e.to_string()))
+    RecordBatch::try_new(Arc::clone(schema), arrays)
+        .map_err(|e| ConnectorError::internal("failed to assemble record batch", e))
 }
 
 /// Strip the schema qualifier and identifier quotes from a type name.
@@ -637,5 +746,82 @@ mod tests {
 
         let t = chrono::NaiveTime::from_hms_micro_opt(23, 59, 59, 999_999).unwrap();
         assert_eq!(time_to_micros(t), 86_399_999_999);
+    }
+}
+
+#[cfg(test)]
+mod error_reporting_tests {
+    use super::*;
+    use commons::test_support::{StaticCredentials, connection};
+
+    const SECRET: &str = "LEAK-SENTINEL-pg-pw";
+
+    #[test]
+    fn rejected_query_keeps_reason_sqlstate_and_hint() {
+        let err = classify_database_error(
+            "42703",
+            "column \"nickname\" does not exist",
+            Some("Perhaps you meant to reference the column \"users.name\"."),
+        );
+        assert!(matches!(err, ConnectorError::SQLError(_)), "{err:?}");
+        assert_eq!(
+            err.message(),
+            "column \"nickname\" does not exist (SQLSTATE 42703); hint: Perhaps you meant to reference the column \"users.name\"."
+        );
+    }
+
+    #[test]
+    fn server_side_failures_are_connection_errors() {
+        for code in ["28P01", "08006", "53300", "57P01", "58000"] {
+            assert!(
+                matches!(
+                    classify_database_error(code, "x", None),
+                    ConnectorError::ConnectionError(_)
+                ),
+                "{code}"
+            );
+        }
+        assert!(matches!(
+            classify_database_error("57014", "canceling statement due to statement timeout", None),
+            ConnectorError::SQLError(_)
+        ));
+    }
+
+    #[test]
+    fn client_side_failures_are_classified() {
+        assert!(matches!(
+            map_sqlx_error(sqlx::Error::PoolTimedOut),
+            ConnectorError::ConnectionError(_)
+        ));
+        let io = sqlx::Error::Io(std::io::Error::new(
+            std::io::ErrorKind::ConnectionRefused,
+            "Connection refused",
+        ));
+        let err = map_sqlx_error(io);
+        assert!(matches!(err, ConnectorError::ConnectionError(_)));
+        assert!(err.message().contains("Connection refused"), "{}", err.message());
+        assert!(matches!(
+            map_sqlx_error(sqlx::Error::WorkerCrashed),
+            ConnectorError::Internal { .. }
+        ));
+    }
+
+    #[tokio::test]
+    async fn unreachable_server_reports_the_cause_without_the_password() {
+        let config = ConnectorConfig {
+            connection_timeout_secs: 2,
+            ..ConnectorConfig::default()
+        };
+        let uri = format!("postgres://alice:{SECRET}@127.0.0.1:1/app");
+        let err = PgConnector::new(Duration::from_secs(60), Duration::from_secs(60), 10, config)
+            .get_reader(&connection("pg-1", &[]), &StaticCredentials::new(&[("URI", &uri)]))
+            .await
+            .err()
+            .unwrap();
+        let msg = err.message();
+        assert!(matches!(err, ConnectorError::ConnectionError(_)), "{err:?}");
+        assert!(msg.starts_with("unable to connect to PostgreSQL: "), "{msg}");
+        assert!(msg.to_lowercase().contains("connection refused"), "{msg}");
+        assert!(!msg.contains(SECRET), "{msg}");
     }
 }

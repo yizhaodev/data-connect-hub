@@ -8,7 +8,9 @@ use arrow::record_batch::RecordBatch;
 use commons::api::connections::{DataConnectionResource, DataFormat};
 use commons::api::connector::{BinaryQuery, CredentialsResolver};
 use commons::api::connector::{DataReader, FlightConnector, Query, QueryOptions, QueryOutput, TableInfo};
+use commons::api::diagnostics::{body_excerpt, error_chain};
 use commons::api::errors::ConnectorError;
+use commons::api::redact::{RedactingReader, Redactor};
 use commons::utils::config::ConnectorConfig;
 use format_readers::FileFormat;
 use futures::TryStreamExt;
@@ -25,7 +27,7 @@ const KEY_ENDPOINT: &str = "AWS_S3_ENDPOINT";
 const KEY_CA_CERT: &str = "AWS_S3_CA_CERT";
 
 pub struct S3Connector {
-    operators: Cache<String, Operator>,
+    operators: Cache<String, (Operator, Arc<Redactor>)>,
     config: ConnectorConfig,
 }
 
@@ -41,14 +43,23 @@ impl S3Connector {
         }
     }
 
+    /// insert_operator caches a prebuilt operator for a connection. The
+    /// operator carries no credentials known to DCH, so its errors only get
+    /// URL passwords masked.
     pub async fn insert_operator(&self, connection_id: &str, operator: Operator) {
-        self.operators.insert(connection_id.to_string(), operator).await;
+        self.operators
+            .insert(connection_id.to_string(), (operator, Arc::new(Redactor::default())))
+            .await;
     }
 }
 
 fn build_http_transport(ca_cert: &str) -> Result<HttpTransporter, ConnectorError> {
-    let certificates = Certificate::from_pem_bundle(ca_cert.as_bytes())
-        .map_err(|error| ConnectorError::ConfigError(format!("{KEY_CA_CERT} contains invalid PEM data: {error}")))?;
+    let certificates = Certificate::from_pem_bundle(ca_cert.as_bytes()).map_err(|error| {
+        ConnectorError::ConfigError(format!(
+            "{KEY_CA_CERT} contains invalid PEM data: {}",
+            error_chain(&error)
+        ))
+    })?;
 
     if certificates.is_empty() {
         return Err(ConnectorError::ConfigError(format!(
@@ -61,9 +72,9 @@ fn build_http_transport(ca_cert: &str) -> Result<HttpTransporter, ConnectorError
         client_builder = client_builder.add_root_certificate(certificate);
     }
 
-    let client = client_builder
-        .build()
-        .map_err(|error| ConnectorError::ConfigError(format!("failed to configure S3 TLS client: {error}")))?;
+    let client = client_builder.build().map_err(|error| {
+        ConnectorError::ConfigError(format!("failed to configure S3 TLS client: {}", error_chain(&error)))
+    })?;
 
     Ok(HttpTransporter::new(ReqwestTransport::new(client)))
 }
@@ -125,13 +136,70 @@ fn build_operator(
     Ok(op)
 }
 
-fn map_opendal_error(e: opendal::Error, context: &str, path: &str) -> ConnectorError {
-    tracing::error!(path, error = %e, "{context}");
+/// map_opendal_error classifies an OpenDAL error for `path` and keeps the S3
+/// reason, e.g. `NoSuchBucket` or `SignatureDoesNotMatch`, or the transport
+/// cause such as a refused connection. `action` names the failed operation.
+fn map_opendal_error(e: opendal::Error, action: &str, path: &str) -> ConnectorError {
+    tracing::error!(path, error = %e, "{action}");
+    let detail = opendal_detail(&e);
+    let with_detail = |text: String| {
+        if detail.is_empty() {
+            text
+        } else {
+            format!("{text} ({detail})")
+        }
+    };
     match e.kind() {
-        opendal::ErrorKind::NotFound => ConnectorError::NotFound(format!("'{path}' not found")),
-        opendal::ErrorKind::PermissionDenied => ConnectorError::ConnectionError(format!("access denied for '{path}'")),
-        _ => ConnectorError::IOError(format!("{context} '{path}'")),
+        opendal::ErrorKind::NotFound => ConnectorError::NotFound(with_detail(format!("'{path}' not found"))),
+        opendal::ErrorKind::PermissionDenied => {
+            ConnectorError::ConnectionError(with_detail(format!("access denied for '{path}'")))
+        },
+        opendal::ErrorKind::IsADirectory
+        | opendal::ErrorKind::NotADirectory
+        | opendal::ErrorKind::RangeNotSatisfied => {
+            ConnectorError::InvalidRequest(with_detail(format!("{action} '{path}' failed: {}", e.kind())))
+        },
+        opendal::ErrorKind::Unsupported => {
+            ConnectorError::UnsupportedOperation(with_detail(format!("{action} '{path}' is not supported")))
+        },
+        // Network failures, timeouts, throttling and invalid settings: the
+        // storage could not serve the request.
+        kind => ConnectorError::ConnectionError(with_detail(format!("{action} '{path}' failed: {kind}"))),
     }
+}
+
+/// opendal_detail renders the client-relevant part of an OpenDAL error: the
+/// S3 error code and message, or the transport cause from the source chain.
+/// The error's context is left out on purpose; it dumps the request URI and
+/// the full response head, which belong in the log only.
+fn opendal_detail(e: &opendal::Error) -> String {
+    let mut parts = Vec::new();
+    let message = e.message().trim();
+    if !message.is_empty() {
+        parts.push(s3_error_summary(message).unwrap_or_else(|| body_excerpt(message)));
+    }
+    if let Some(source) = std::error::Error::source(e) {
+        parts.push(error_chain(source));
+    }
+    parts.join(": ")
+}
+
+/// s3_error_summary extracts `Code: Message` from OpenDAL's rendering of a
+/// parsed S3 error response (`S3Error { code: "...", message: "...", ... }`).
+fn s3_error_summary(message: &str) -> Option<String> {
+    let field = |name: &str| {
+        let start = message.find(&format!("{name}: \""))? + name.len() + 3;
+        let end = start + message[start..].find('"')?;
+        Some(&message[start..end])
+    };
+    if !message.starts_with("S3Error {") {
+        return None;
+    }
+    let code = field("code")?;
+    Some(match field("message").filter(|m| !m.is_empty()) {
+        Some(text) => format!("{code}: {text}"),
+        None => code.to_string(),
+    })
 }
 
 const MAX_JSON_BYTES: u64 = 128 * 1024 * 1024;
@@ -140,18 +208,18 @@ async fn read_json_checked(operator: &Operator, path: &str) -> Result<Vec<u8>, C
     let reader = operator
         .reader(path)
         .await
-        .map_err(|e| map_opendal_error(e, "Failed to create reader for", path))?;
+        .map_err(|e| map_opendal_error(e, "open", path))?;
 
     let mut stream = reader
         .into_stream(..)
         .await
-        .map_err(|e| map_opendal_error(e, "Failed to open stream for", path))?;
+        .map_err(|e| map_opendal_error(e, "read", path))?;
 
     let mut bytes = Vec::new();
     while let Some(buf) = stream
         .try_next()
         .await
-        .map_err(|e| map_opendal_error(e, "Failed to read", path))?
+        .map_err(|e| map_opendal_error(e, "read", path))?
     {
         let chunk = buf.to_bytes();
         if bytes.len() as u64 + chunk.len() as u64 > MAX_JSON_BYTES {
@@ -196,22 +264,26 @@ impl FlightConnector for S3Connector {
         let io_timeout = self.config.read_timeout();
         let cache_key = data_connection.metadata.id.clone();
 
-        let operator = self
+        let (operator, redactor) = self
             .operators
             .try_get_with(cache_key, async {
                 let credentials = credentials_resolver.resolve(data_connection).await?;
+                let redactor = Arc::new(Redactor::from_credentials(&credentials));
                 build_operator(&credentials, connection_timeout, io_timeout)
+                    .map(|client| (client, Arc::clone(&redactor)))
+                    .map_err(|e| redactor.redact_error(e))
             })
             .await
             .map_err(|e| Arc::try_unwrap(e).unwrap_or_else(|arc| (*arc).clone()))?;
 
         let format_hint = data_connection.resource.properties.get("format").cloned();
-        Ok(Arc::new(S3Reader {
+        let reader = S3Reader {
             operator,
             format_hint,
             config: self.config,
             json_cache: Mutex::new(None),
-        }))
+        };
+        Ok(Arc::new(RedactingReader::new(reader, redactor)))
     }
 }
 
@@ -233,7 +305,7 @@ impl S3Reader {
             .reader_with(path)
             .chunk(self.config.chunk_size)
             .await
-            .map_err(|e| map_opendal_error(e, "Failed to create S3 reader for", path))?;
+            .map_err(|e| map_opendal_error(e, "open", path))?;
         Ok(reader)
     }
 }
@@ -307,7 +379,7 @@ impl DataReader for S3Reader {
         self.operator
             .stat(&query.path)
             .await
-            .map_err(|e| map_opendal_error(e, "Cannot read", &query.path))?;
+            .map_err(|e| map_opendal_error(e, "stat", &query.path))?;
         Ok(())
     }
 
@@ -319,18 +391,18 @@ impl DataReader for S3Reader {
         let mut buf_stream = reader
             .into_stream(..)
             .await
-            .map_err(|e| map_opendal_error(e, "Failed to open stream for", &query.path))?;
+            .map_err(|e| map_opendal_error(e, "read", &query.path))?;
 
         let stream = async_stream::try_stream! {
             while let Some(buf) = buf_stream
                 .try_next()
                 .await
-                .map_err(|e| map_opendal_error(e, "Stream read error for", &query.path))?
+                .map_err(|e| map_opendal_error(e, "read", &query.path))?
             {
                 let chunk = buf.to_bytes();
                 let array = BinaryArray::from_vec(vec![&chunk]);
                 let batch = RecordBatch::try_new(schema.clone(), vec![Arc::new(array)])
-                    .map_err(|e| ConnectorError::IOError(format!("Failed to create batch: {e}")))?;
+                    .map_err(|e| ConnectorError::internal("failed to build binary record batch", e))?;
                 yield batch;
             }
         };
@@ -340,10 +412,17 @@ impl DataReader for S3Reader {
 
     #[tracing::instrument(skip_all, fields(connector.provider = PROVIDER))]
     async fn check_connection(&self) -> Result<(), ConnectorError> {
-        self.operator.check().await.map_err(|e| {
-            tracing::error!(error = %e, "S3 connection check failed");
-            ConnectorError::ConnectionError(format!("S3 connection check failed: {e}"))
-        })
+        // Like `Operator::check`, but NotFound fails the check too. OpenDAL
+        // classifies a standard `NoSuchBucket` reply as ConfigInvalid, yet
+        // some S3-compatible stores answer a missing bucket with a bare 404,
+        // which `Operator::check` would accept.
+        let to_error = |e: opendal::Error| {
+            let message = map_opendal_error(e, "list", "/").message().to_string();
+            ConnectorError::ConnectionError(format!("S3 connection check failed: {message}"))
+        };
+        let mut lister = self.operator.lister_with("/").limit(1).await.map_err(to_error)?;
+        lister.try_next().await.map_err(to_error)?;
+        Ok(())
     }
 
     #[tracing::instrument(
@@ -365,10 +444,7 @@ impl DataReader for S3Reader {
             .list_with(list_prefix)
             .recursive(true)
             .await
-            .map_err(|e| {
-                tracing::error!(error = %e, "failed to list S3 objects");
-                ConnectorError::IOError("failed to list S3 objects".to_string())
-            })?;
+            .map_err(|e| map_opendal_error(e, "list", &format!("{list_prefix}*")))?;
 
         let paths: Vec<String> = entries
             .into_iter()
@@ -786,5 +862,112 @@ mod tests {
             reader.json_cache.lock().unwrap().is_some(),
             "mismatched cache entry should not be cleared"
         );
+    }
+}
+
+#[cfg(test)]
+mod error_reporting_tests {
+    use super::*;
+    use commons::test_support::{ECHO_HEADERS, MockHttpServer, StaticCredentials, connection};
+
+    const ACCESS_KEY: &str = "LEAKSENTINELACCESSKEY";
+    const SECRET_KEY: &str = "LEAK-SENTINEL-s3-secret-key";
+
+    fn s3_error(code: &str, message: &str) -> String {
+        format!(
+            "<?xml version=\"1.0\" encoding=\"UTF-8\"?><Error><Code>{code}</Code><Message>{message}</Message><Resource>/b</Resource><RequestId>req-1</RequestId></Error>"
+        )
+    }
+
+    async fn reader(endpoint: &str) -> Arc<dyn DataReader> {
+        let config = ConnectorConfig {
+            connection_timeout_secs: 2,
+            ..ConnectorConfig::default()
+        };
+        S3Connector::new(Duration::from_secs(60), Duration::from_secs(60), 10, config)
+            .get_reader(
+                &connection("s3-1", &[]),
+                &StaticCredentials::new(&[
+                    ("AWS_S3_BUCKET", "b"),
+                    ("AWS_ACCESS_KEY_ID", ACCESS_KEY),
+                    ("AWS_SECRET_ACCESS_KEY", SECRET_KEY),
+                    ("AWS_S3_ENDPOINT", endpoint),
+                ]),
+            )
+            .await
+            .unwrap()
+    }
+
+    #[test]
+    fn s3_error_summary_extracts_code_and_message() {
+        let rendered = r#"S3Error { code: "NoSuchBucket", message: "The specified bucket does not exist", resource: "/b", request_id: "req-1" }"#;
+        assert_eq!(
+            s3_error_summary(rendered).as_deref(),
+            Some("NoSuchBucket: The specified bucket does not exist")
+        );
+        assert_eq!(s3_error_summary("<html>502</html>"), None);
+    }
+
+    #[tokio::test]
+    async fn missing_bucket_fails_the_check() {
+        let server = MockHttpServer::start(404, &s3_error("NoSuchBucket", "The specified bucket does not exist")).await;
+        let err = reader(&server.url()).await.check_connection().await.unwrap_err();
+        assert!(matches!(err, ConnectorError::ConnectionError(_)), "{err:?}");
+        assert_eq!(
+            err.message(),
+            "S3 connection check failed: list '/' failed: ConfigInvalid (NoSuchBucket: The specified bucket does not exist)"
+        );
+    }
+
+    #[tokio::test]
+    async fn bare_not_found_fails_the_check() {
+        let server = MockHttpServer::start(404, "").await;
+        let err = reader(&server.url()).await.check_connection().await.unwrap_err();
+        assert_eq!(err.message(), "S3 connection check failed: '/' not found");
+    }
+
+    #[tokio::test]
+    async fn bad_signature_reports_the_s3_reason() {
+        let server = MockHttpServer::start(
+            403,
+            &s3_error(
+                "SignatureDoesNotMatch",
+                "The request signature we calculated does not match the signature you provided.",
+            ),
+        )
+        .await;
+        let err = reader(&server.url()).await.check_connection().await.unwrap_err();
+        assert_eq!(
+            err.message(),
+            "S3 connection check failed: access denied for '/' (SignatureDoesNotMatch: The request signature we calculated does not match the signature you provided.)"
+        );
+    }
+
+    #[tokio::test]
+    async fn echoed_credentials_are_redacted() {
+        let server = MockHttpServer::start(403, ECHO_HEADERS).await;
+        let msg = reader(&server.url())
+            .await
+            .check_connection()
+            .await
+            .unwrap_err()
+            .message()
+            .to_string();
+        assert!(msg.contains("access denied"), "{msg}");
+        // The excerpt may cut the Authorization header anywhere, including
+        // inside the access key; no recognizable part of it may survive.
+        assert!(!msg.contains(&ACCESS_KEY[..4]), "{msg}");
+        assert!(!msg.contains(SECRET_KEY), "{msg}");
+    }
+
+    #[tokio::test]
+    async fn unreachable_endpoint_reports_the_cause() {
+        let err = reader("http://127.0.0.1:1").await.check_connection().await.unwrap_err();
+        let msg = err.message();
+        assert!(
+            msg.starts_with("S3 connection check failed: list '/' failed: Unexpected"),
+            "{msg}"
+        );
+        assert!(msg.to_lowercase().contains("connection refused"), "{msg}");
     }
 }
